@@ -30,6 +30,7 @@ class PriorDataLoader(DataLoader):
         num_datapoints_max: int,
         num_features: int,
         device: torch.device,
+        mask_prob: float = 0.0,
     ):
         self.get_batch_function = get_batch_function
         self.num_steps = num_steps
@@ -37,15 +38,57 @@ class PriorDataLoader(DataLoader):
         self.num_datapoints_max = num_datapoints_max
         self.num_features = num_features
         self.device = device
+        self.mask_prob = mask_prob
 
     def __iter__(self) -> Iterator[Dict[str, Union[torch.Tensor, int]]]:
-        return iter(
-            self.get_batch_function(self.batch_size, self.num_datapoints_max, self.num_features)
-            for _ in range(self.num_steps)
-        )
+        for _ in range(self.num_steps):
+            batch = self.get_batch_function(self.batch_size, self.num_datapoints_max, self.num_features)
+            if self.mask_prob > 0:
+                batch['x'] = self._apply_random_masking(batch['x'], batch['single_eval_pos'])
+            yield batch
 
     def __len__(self) -> int:
         return self.num_steps
+
+    def _apply_random_masking(self, x: torch.Tensor, single_eval_pos: int) -> torch.Tensor:
+        """
+        Apply random masking to training data only (before single_eval_pos).
+        Ensures at least one feature per sample remains unmasked.
+
+        Args:
+            x: (torch.Tensor) Feature tensor of shape (batch_size, num_rows, num_features)
+            single_eval_pos: (int) Position separating train and test data
+
+        Returns:
+            (torch.Tensor) Masked feature tensor with NaN at masked positions
+        """
+        if self.mask_prob <= 0:
+            return x
+
+        x_masked = x.clone()
+        batch_size, num_rows, num_features = x.shape
+
+        # Only mask training data
+        x_train = x_masked[:, :single_eval_pos, :]
+
+        # Generate random mask
+        mask = torch.rand(batch_size, single_eval_pos, num_features) < self.mask_prob
+
+        # Ensure at least one feature per sample is unmasked
+        all_masked = mask.all(dim=2)  # (batch_size, single_eval_pos)
+        if all_masked.any():
+            # For samples that are fully masked, randomly unmask one feature
+            for b in range(batch_size):
+                for r in range(single_eval_pos):
+                    if all_masked[b, r]:
+                        random_feature = torch.randint(0, num_features, (1,)).item()
+                        mask[b, r, random_feature] = False
+
+        # Apply mask by setting to NaN
+        x_train[mask] = float('nan')
+        x_masked[:, :single_eval_pos, :] = x_train
+
+        return x_masked
 
 
 class PriorDumpDataLoader(DataLoader):
@@ -57,10 +100,11 @@ class PriorDumpDataLoader(DataLoader):
         batch_size (int): Batch size.
         device (torch.device): Device to load tensors onto.
     """
-    def __init__(self, filename, num_steps, batch_size, device, starting_index=0):
+    def __init__(self, filename, num_steps, batch_size, device, starting_index=0, mask_prob=0.0):
         self.filename = filename
         self.num_steps = num_steps
         self.batch_size = batch_size
+        self.mask_prob = mask_prob
         with h5py.File(self.filename, "r") as f:
             self.num_datapoints_max = f['X'].shape[0]
             if "max_num_classes" in f:
@@ -103,6 +147,10 @@ class PriorDumpDataLoader(DataLoader):
                     )
                     self.pointer = 0
 
+                # Apply masking if enabled
+                if self.mask_prob > 0:
+                    x = self._apply_random_masking(x, single_eval_pos[0].item())
+
                 yield dict(
                     x=x.to(self.device),
                     y=y.to(self.device),
@@ -113,6 +161,46 @@ class PriorDumpDataLoader(DataLoader):
 
     def __len__(self):
         return self.num_steps
+
+    def _apply_random_masking(self, x: torch.Tensor, single_eval_pos: int) -> torch.Tensor:
+        """
+        Apply random masking to training data only (before single_eval_pos).
+        Ensures at least one feature per sample remains unmasked.
+
+        Args:
+            x: (torch.Tensor) Feature tensor of shape (batch_size, num_rows, num_features)
+            single_eval_pos: (int) Position separating train and test data
+
+        Returns:
+            (torch.Tensor) Masked feature tensor with NaN at masked positions
+        """
+        if self.mask_prob <= 0:
+            return x
+
+        x_masked = x.clone()
+        batch_size, num_rows, num_features = x.shape
+
+        # Only mask training data
+        x_train = x_masked[:, :single_eval_pos, :]
+
+        # Generate random mask
+        mask = torch.rand(batch_size, single_eval_pos, num_features) < self.mask_prob
+
+        # Ensure at least one feature per sample is unmasked
+        all_masked = mask.all(dim=2)  # (batch_size, single_eval_pos)
+        if all_masked.any():
+            # For samples that are fully masked, randomly unmask one feature
+            for b in range(batch_size):
+                for r in range(single_eval_pos):
+                    if all_masked[b, r]:
+                        random_feature = torch.randint(0, num_features, (1,)).item()
+                        mask[b, r, random_feature] = False
+
+        # Apply mask by setting to NaN
+        x_train[mask] = float('nan')
+        x_masked[:, :single_eval_pos, :] = x_train
+
+        return x_masked
 
 
 class TabICLPriorDataLoader(DataLoader):
@@ -141,6 +229,7 @@ class TabICLPriorDataLoader(DataLoader):
         device: torch.device,
         scm_fixed_hp: Dict[str, Any],
         scm_sampled_hp: Dict[str, Any],
+        mask_prob: float = 0.0,
     ):
         self.num_steps = num_steps
         self.batch_size = batch_size
@@ -150,6 +239,7 @@ class TabICLPriorDataLoader(DataLoader):
         self.max_features = max_features
         self.max_num_classes = max_num_classes
         self.device = device
+        self.mask_prob = mask_prob
 
         self.pd = TabICLPriorDataset(
             batch_size=batch_size,
@@ -174,6 +264,11 @@ class TabICLPriorDataLoader(DataLoader):
         if (train_size != train_size[0]).any():
             return None # skip batches with varying train sizes for now
         single_eval_pos = train_size[0].item()  # should be all the same since we use batch_size_per_gp=batch_size
+
+        # Apply masking if enabled
+        if self.mask_prob > 0:
+            x = self._apply_random_masking(x, single_eval_pos)
+
         return dict(
             x=x.to(self.device),
             y=y.to(self.device),
@@ -192,6 +287,46 @@ class TabICLPriorDataLoader(DataLoader):
 
     def __len__(self):
         return self.num_steps
+
+    def _apply_random_masking(self, x: torch.Tensor, single_eval_pos: int) -> torch.Tensor:
+        """
+        Apply random masking to training data only (before single_eval_pos).
+        Ensures at least one feature per sample remains unmasked.
+
+        Args:
+            x: (torch.Tensor) Feature tensor of shape (batch_size, num_rows, num_features)
+            single_eval_pos: (int) Position separating train and test data
+
+        Returns:
+            (torch.Tensor) Masked feature tensor with NaN at masked positions
+        """
+        if self.mask_prob <= 0:
+            return x
+
+        x_masked = x.clone()
+        batch_size, num_rows, num_features = x.shape
+
+        # Only mask training data
+        x_train = x_masked[:, :single_eval_pos, :]
+
+        # Generate random mask
+        mask = torch.rand(batch_size, single_eval_pos, num_features) < self.mask_prob
+
+        # Ensure at least one feature per sample is unmasked
+        all_masked = mask.all(dim=2)  # (batch_size, single_eval_pos)
+        if all_masked.any():
+            # For samples that are fully masked, randomly unmask one feature
+            for b in range(batch_size):
+                for r in range(single_eval_pos):
+                    if all_masked[b, r]:
+                        random_feature = torch.randint(0, num_features, (1,)).item()
+                        mask[b, r, random_feature] = False
+
+        # Apply mask by setting to NaN
+        x_train[mask] = float('nan')
+        x_masked[:, :single_eval_pos, :] = x_train
+
+        return x_masked
 
 
 class TICLPriorDataLoader(DataLoader):
@@ -216,9 +351,11 @@ class TICLPriorDataLoader(DataLoader):
         num_features: int,
         device: torch.device,
         min_eval_pos: int = 10,
+        mask_prob: float = 0.0,
     ):
         self.num_steps = num_steps
         self.device = device
+        self.mask_prob = mask_prob
 
         self.pd = TICLPriorDataset(
             prior=prior,
@@ -236,6 +373,10 @@ class TICLPriorDataLoader(DataLoader):
         y = y.permute(1, 0)
         target_y = target_y.permute(1, 0)
 
+        # Apply masking if enabled
+        if self.mask_prob > 0:
+            x = self._apply_random_masking(x, single_eval_pos)
+
         return dict(
             x=x.to(self.device),
             y=y.to(self.device),
@@ -248,3 +389,43 @@ class TICLPriorDataLoader(DataLoader):
 
     def __len__(self):
         return self.num_steps
+
+    def _apply_random_masking(self, x: torch.Tensor, single_eval_pos: int) -> torch.Tensor:
+        """
+        Apply random masking to training data only (before single_eval_pos).
+        Ensures at least one feature per sample remains unmasked.
+
+        Args:
+            x: (torch.Tensor) Feature tensor of shape (batch_size, num_rows, num_features)
+            single_eval_pos: (int) Position separating train and test data
+
+        Returns:
+            (torch.Tensor) Masked feature tensor with NaN at masked positions
+        """
+        if self.mask_prob <= 0:
+            return x
+
+        x_masked = x.clone()
+        batch_size, num_rows, num_features = x.shape
+
+        # Only mask training data
+        x_train = x_masked[:, :single_eval_pos, :]
+
+        # Generate random mask
+        mask = torch.rand(batch_size, single_eval_pos, num_features) < self.mask_prob
+
+        # Ensure at least one feature per sample is unmasked
+        all_masked = mask.all(dim=2)  # (batch_size, single_eval_pos)
+        if all_masked.any():
+            # For samples that are fully masked, randomly unmask one feature
+            for b in range(batch_size):
+                for r in range(single_eval_pos):
+                    if all_masked[b, r]:
+                        random_feature = torch.randint(0, num_features, (1,)).item()
+                        mask[b, r, random_feature] = False
+
+        # Apply mask by setting to NaN
+        x_train[mask] = float('nan')
+        x_masked[:, :single_eval_pos, :] = x_train
+
+        return x_masked

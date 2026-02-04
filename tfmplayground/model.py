@@ -11,7 +11,7 @@ from gtfm.utils import adj
 
 
 class NanoTabPFNModel(nn.Module):
-    def __init__(self, embedding_size: int, num_attention_heads: int, mlp_hidden_size: int, num_layers: int, num_outputs: int, mask_attn: bool = False):
+    def __init__(self, embedding_size: int, num_attention_heads: int, mlp_hidden_size: int, num_layers: int, num_outputs: int, mask_attn: bool = False, enable_mlm: bool = False, mask_embedding_size: int = None):
         """ Initializes the feature/target encoder, transformer stack and decoder """
         super().__init__()
         self.embedding_size = embedding_size
@@ -24,6 +24,18 @@ class NanoTabPFNModel(nn.Module):
         self.target_encoder = TargetEncoder(embedding_size)
         self.transformer_encoder = TransformerEncoderStack(num_layers, embedding_size, num_attention_heads, mlp_hidden_size)
         self.decoder = Decoder(embedding_size, mlp_hidden_size, num_outputs)
+
+        # MLM components
+        self.enable_mlm = enable_mlm
+        if enable_mlm:
+            mask_emb_size = mask_embedding_size or embedding_size
+            self.mask_embedding = nn.Parameter(torch.randn(mask_emb_size))
+            self.feature_decoder = nn.Sequential(
+                nn.Linear(embedding_size, mlp_hidden_size),
+                nn.LayerNorm(mlp_hidden_size),
+                nn.GELU(),
+                nn.Linear(mlp_hidden_size, 1)
+            )
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         """
@@ -85,9 +97,56 @@ class NanoTabPFNModel(nn.Module):
 
         return attn_mask
 
-    def _forward(self, src: Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], single_eval_pos: int, num_mem_chunks: int = 1) -> torch.Tensor:
+    def compute_mlm_loss(self, x_src_original: torch.Tensor, transformer_output: torch.Tensor, single_eval_pos: int, mask_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the masked language modeling loss for feature reconstruction.
+
+        Args:
+            x_src_original: (torch.Tensor) Original UNMASKED features (before NaN masking), shape (batch_size, num_rows, num_features)
+            transformer_output: (torch.Tensor) Output from transformer encoder, shape (batch_size, num_rows, num_features+1, embedding_size)
+            single_eval_pos: (int) Position separating train and test data
+            mask_indices: (torch.Tensor) Boolean mask indicating which positions were masked, shape (batch_size, num_rows, num_features)
+
+        Returns:
+            (torch.Tensor) Scalar MSE loss on masked positions only
+        """
+        # Extract training data only (before single_eval_pos)
+        x_train_original = x_src_original[:, :single_eval_pos, :]  # (B, train_rows, num_features)
+        transformer_train = transformer_output[:, :single_eval_pos, :-1, :]  # (B, train_rows, num_features, E) - exclude target column
+        mask_train = mask_indices[:, :single_eval_pos, :]  # (B, train_rows, num_features)
+
+        # Check if there are any masked positions
+        if not mask_train.any():
+            return torch.tensor(0.0, device=x_src_original.device)
+
+        # Decode features from transformer output
+        batch_size, train_rows, num_features, embedding_size = transformer_train.shape
+        transformer_train_flat = transformer_train.reshape(batch_size * train_rows * num_features, embedding_size)
+        reconstructed_flat = self.feature_decoder(transformer_train_flat).squeeze(-1)  # (B*train_rows*num_features,)
+        reconstructed = reconstructed_flat.reshape(batch_size, train_rows, num_features)
+
+        # Normalize the original values the same way the FeatureEncoder does
+        x_train_original_normalized = x_train_original.clone()
+        mean = torch.nanmean(x_train_original, dim=1, keepdims=True)
+        var = torch.nanmean((x_train_original - mean) ** 2, dim=1, keepdims=True)
+        std = torch.sqrt(var) + 1e-8
+        x_train_original_normalized = (x_train_original_normalized - mean) / std
+        x_train_original_normalized = torch.clip(x_train_original_normalized, min=-100, max=100)
+
+        # Compute MSE loss only on masked positions
+        loss = F.mse_loss(reconstructed[mask_train], x_train_original_normalized[mask_train])
+
+        return loss
+
+    def _forward(self, src: Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], single_eval_pos: int, num_mem_chunks: int = 1, x_src_original: torch.Tensor = None) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         x_src, y_src, adj = src
         if adj is not None: assert x_src.shape[-1] == adj.shape[1]-1, f"{x_src.shape = }, {adj.shape = }"
+
+        # Detect masked positions (NaN values) before any processing
+        mask_indices = None
+        if self.enable_mlm and x_src_original is not None:
+            mask_indices = torch.isnan(x_src)  # (batch_size, num_rows, num_features)
+
         # If self.attn_mask is False, attn_mask = None, which results in no masking inside transformer_encoder's MultiheadAttention.
         attn_mask = self.get_attn_mask(adj) if (self.mask_attn and adj is not None) else None
         # we expect the labels to look like (batches, num_train_datapoints, 1),
@@ -96,7 +155,7 @@ class NanoTabPFNModel(nn.Module):
             y_src = y_src.unsqueeze(-1)
         # from here on B=Batches, R=Rows, C=Columns, E=embedding size
         # converts scalar values to embeddings, so (B,R,C-1) -> (B,R,C-1,E)
-        x_src = self.feature_encoder(x_src, single_eval_pos)
+        x_src = self.feature_encoder(x_src, single_eval_pos, mask_embedding=self.mask_embedding if self.enable_mlm else None)
         num_rows = x_src.shape[1]
         # padds the y_train up to y by using the mean,
         # then converts scalar values to embeddings (B,R,1,E)
@@ -105,13 +164,22 @@ class NanoTabPFNModel(nn.Module):
         # to give us the full table of embeddings (B,R,C,E))
         src = torch.cat([x_src, y_src], 2)
         # repeatedly applies the transformer block on (B,R,C,E)
-        output = self.transformer_encoder(src, single_eval_pos, attn_mask=attn_mask, num_mem_chunks=num_mem_chunks)
+        transformer_output = self.transformer_encoder(src, single_eval_pos, attn_mask=attn_mask, num_mem_chunks=num_mem_chunks)
         # selects the target embeddings (B,num_targets,1,E)
-        output = output[:, single_eval_pos:, -1, :]
+        output = transformer_output[:, single_eval_pos:, -1, :]
         # runs the embeddings through the decoder to get
         # the logits of our predictions (B,num_targets,num_classes)
         output = self.decoder(output)
-        return output
+
+        # Compute MLM loss if enabled and in training mode
+        mlm_loss = None
+        if self.enable_mlm and self.training and x_src_original is not None and mask_indices is not None:
+            mlm_loss = self.compute_mlm_loss(x_src_original, transformer_output, single_eval_pos, mask_indices)
+
+        if self.enable_mlm:
+            return output, mlm_loss if mlm_loss is not None else torch.tensor(0.0, device=output.device)
+        else:
+            return output
 
 
 # handle variable number of features in here?
@@ -121,24 +189,52 @@ class FeatureEncoder(nn.Module):
         super().__init__()
         self.linear_layer = nn.Linear(1, embedding_size)
 
-    def forward(self, x: torch.Tensor, single_eval_pos: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, single_eval_pos: int, mask_embedding: torch.Tensor = None) -> torch.Tensor:
         """
         Normalizes all the features based on the mean and std of the features of the training data,
         clips them between -100 and 100, then applies a linear layer to embed the features.
+        If mask_embedding is provided, replaces NaN values with the mask embedding.
 
         Args:
             x: (torch.Tensor) a tensor of shape (batch_size, num_rows, num_features)
             single_eval_pos: (int) the number of datapoints in X_train
+            mask_embedding: (torch.Tensor) optional mask embedding to use for NaN values
         Returns:
             (torch.Tensor) a tensor of shape (batch_size, num_rows, num_features, embedding_size), representing
                            the embeddings of the features
         """
-        x = x.unsqueeze(-1)
-        mean = torch.mean(x[:, :single_eval_pos], dim=1, keepdims=True)
-        std = torch.std(x[:, :single_eval_pos], dim=1, keepdims=True) + 1e-8
-        x = (x-mean)/std
+        # Detect masked positions before any transformations
+        is_masked = torch.isnan(x)  # (batch_size, num_rows, num_features)
+
+        x = x.unsqueeze(-1)  # (batch_size, num_rows, num_features, 1)
+
+        # Use nanmean and nanstd for normalization when there are NaN values
+        if mask_embedding is not None and is_masked.any():
+            mean = torch.nanmean(x[:, :single_eval_pos], dim=1, keepdims=True)
+            # Compute nanstd manually since PyTorch doesn't have it
+            var = torch.nanmean((x[:, :single_eval_pos] - mean) ** 2, dim=1, keepdims=True)
+            std = torch.sqrt(var) + 1e-8
+        else:
+            mean = torch.mean(x[:, :single_eval_pos], dim=1, keepdims=True)
+            std = torch.std(x[:, :single_eval_pos], dim=1, keepdims=True) + 1e-8
+
+        x = (x - mean) / std
         x = torch.clip(x, min=-100, max=100)
-        return self.linear_layer(x)
+
+        # Replace NaN values with 0 before embedding (will be replaced with mask embedding after)
+        x = torch.nan_to_num(x, nan=0.0)
+
+        # Embed the features
+        x = self.linear_layer(x)  # (batch_size, num_rows, num_features, embedding_size)
+
+        # Replace masked positions with mask embedding
+        if mask_embedding is not None and is_masked.any():
+            is_masked = is_masked.unsqueeze(-1)  # (batch_size, num_rows, num_features, 1)
+            # Broadcast mask_embedding to match the shape
+            mask_emb_expanded = mask_embedding.view(1, 1, 1, -1)
+            x = torch.where(is_masked, mask_emb_expanded, x)
+
+        return x
 
 
 class TargetEncoder(nn.Module):

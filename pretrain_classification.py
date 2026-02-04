@@ -26,6 +26,10 @@ parser.add_argument("--epochs", type=int, default=10000, help="number of epochs 
 parser.add_argument("--loadcheckpoint", type=str, default=None, help="checkpoint from which to continue training")
 parser.add_argument("--multigpu", action="store_true", help="enable multi-GPU training using data parallelism")
 parser.add_argument("--runname", type=str, default="nanotabpfn", help="name of the training run, will be used to store the training checkpoints and for WandB logging")
+parser.add_argument("--enablemlm", action="store_true", help="enable masked language modeling (MLM) objective")
+parser.add_argument("--maskprob", type=float, default=0.15, help="probability of masking each feature for MLM")
+parser.add_argument("--lambdamlm", type=float, default=1.0, help="weight for MLM loss in combined loss")
+parser.add_argument("--maskembsize", type=int, default=None, help="dimension of mask embedding (defaults to embedding_size)")
 
 args = parser.parse_args()
 
@@ -36,7 +40,7 @@ ckpt = None
 if args.loadcheckpoint:
     ckpt = torch.load(args.loadcheckpoint)
 
-prior = PriorDumpDataLoader(filename=args.priordump, num_steps=args.steps, batch_size=args.batchsize, device=device, starting_index=args.steps*(ckpt['epoch'] if ckpt else 0))
+prior = PriorDumpDataLoader(filename=args.priordump, num_steps=args.steps, batch_size=args.batchsize, device=device, starting_index=args.steps*(ckpt['epoch'] if ckpt else 0), mask_prob=args.maskprob if args.enablemlm else 0.0)
 
 criterion = nn.CrossEntropyLoss()
 
@@ -46,6 +50,8 @@ model = NanoTabPFNModel(
     mlp_hidden_size=args.hiddensize,
     num_layers=args.layers,
     num_outputs=prior.max_num_classes,
+    enable_mlm=args.enablemlm,
+    mask_embedding_size=args.maskembsize,
 )
 
 if ckpt:
@@ -99,5 +105,6 @@ trained_model, loss = train(
     callbacks=callbacks,
     ckpt=ckpt,
     multi_gpu=args.multigpu,
-    run_name=args.runname
+    run_name=args.runname,
+    lambda_mlm=args.lambdamlm if args.enablemlm else 0.0
 )

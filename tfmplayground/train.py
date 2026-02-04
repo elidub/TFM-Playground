@@ -15,7 +15,7 @@ from tfmplayground.utils import get_default_device
 def train(model: NanoTabPFNModel, prior: DataLoader, criterion: nn.CrossEntropyLoss | FullSupportBarDistribution,
           epochs: int, accumulate_gradients: int = 1, lr: float = 1e-4, device: torch.device = None,
           callbacks: list[Callback] = None, ckpt: Dict[str, torch.Tensor] = None, multi_gpu: bool = False,
-          run_name: str = 'nanoTFM', workdir: str = '.'):
+          run_name: str = 'nanoTFM', workdir: str = '.', lambda_mlm: float = 0.0):
     """
     Trains our model on the given prior using the given criterion.
 
@@ -57,15 +57,23 @@ def train(model: NanoTabPFNModel, prior: DataLoader, criterion: nn.CrossEntropyL
             model.train()  # Turn on the train mode
             optimizer.train()
             total_loss = 0.
+            total_mlm_loss = 0.
             for i, full_data in enumerate(prior):
                 single_eval_pos = full_data['single_eval_pos']
+
+                # Store original unmasked features for MLM loss computation
+                x_original = full_data['x'].clone() if lambda_mlm > 0 else None
+
                 data = (
                     full_data['x'].to(device),
                     full_data['y'][:, :single_eval_pos].to(device),
                     full_data['adj'].to(device),
                 )
-                if (torch.isnan(data[0]).any() or torch.isnan(data[1]).any()):
+
+                # Check for NaN in targets only (features may have NaN for masking)
+                if torch.isnan(data[1]).any():
                     continue
+
                 targets = full_data['target_y'].to(device)
 
                 if regression_task:
@@ -74,7 +82,18 @@ def train(model: NanoTabPFNModel, prior: DataLoader, criterion: nn.CrossEntropyL
                     y_norm = (data[1] - y_mean) / y_std
                     data = (data[0], y_norm, data[2])
 
-                output = model(data, single_eval_pos=single_eval_pos)
+                # Pass original features if MLM is enabled
+                if lambda_mlm > 0 and x_original is not None:
+                    model_output = model(data, single_eval_pos=single_eval_pos, x_src_original=x_original.to(device))
+                    if isinstance(model_output, tuple):
+                        output, mlm_loss = model_output
+                    else:
+                        output = model_output
+                        mlm_loss = torch.tensor(0.0, device=device)
+                else:
+                    output = model(data, single_eval_pos=single_eval_pos)
+                    mlm_loss = torch.tensor(0.0, device=device)
+
                 targets = targets[:, single_eval_pos:]
                 if regression_task:
                     targets = (targets - y_mean) / y_std
@@ -82,13 +101,20 @@ def train(model: NanoTabPFNModel, prior: DataLoader, criterion: nn.CrossEntropyL
                     targets = targets.reshape((-1,)).to(torch.long)
                     output = output.view(-1, output.shape[-1])
 
-                losses = criterion(output, targets)
-                loss = losses.mean() / accumulate_gradients
+                # Compute supervised loss
+                supervised_losses = criterion(output, targets)
+                supervised_loss = supervised_losses.mean()
+
+                # Combine losses
+                total_batch_loss = supervised_loss + lambda_mlm * mlm_loss
+                loss = total_batch_loss / accumulate_gradients
+
                 if torch.isnan(loss):
                     print('Loss is NaN, stopping training batch.')
                     return full_data
                 loss.backward()
-                total_loss += loss.cpu().detach().item() * accumulate_gradients
+                total_loss += supervised_loss.cpu().detach().item()
+                total_mlm_loss += mlm_loss.cpu().detach().item()
 
                 if (i + 1) % accumulate_gradients == 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
@@ -97,6 +123,9 @@ def train(model: NanoTabPFNModel, prior: DataLoader, criterion: nn.CrossEntropyL
 
             end_time = time.time()
             mean_loss: float = total_loss / len(prior)
+            mean_mlm_loss: float = total_mlm_loss / len(prior)
+            if lambda_mlm > 0:
+                print(f'Epoch {epoch}: Supervised Loss = {mean_loss:.4f}, MLM Loss = {mean_mlm_loss:.4f}')
             model.eval()
             optimizer.eval()
 
