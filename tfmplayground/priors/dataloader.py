@@ -330,18 +330,19 @@ class GCFMDataLoader(DataLoader):
             processor_kwargs=processor_kwargs,
         )
 
-    def prep_scm(self, scm, ordered_nodes):
+    def prep_scm(self, graph, ordered_nodes, add_layers: bool = True):
         # return scm
         # print(type(scm))
-        scm = scm.dag.g
+        # scm = scm.dag.g
         # return scm
+        scm = graph
 
-
-        for layer, nodes in enumerate(nx.topological_generations(scm)):
-            # `multipartite_layout` expects the layer as a node attribute, so add the
-            # numeric layer value as a node attribute
-            for node in nodes:
-                scm.nodes[node]["layer"] = layer
+        if add_layers:
+            for layer, nodes in enumerate(nx.topological_generations(scm)):
+                # `multipartite_layout` expects the layer as a node attribute, so add the
+                # numeric layer value as a node attribute
+                for node in nodes:
+                    scm.nodes[node]["layer"] = layer
 
         scm = add_node_types(
             graph=scm, 
@@ -356,18 +357,17 @@ class GCFMDataLoader(DataLoader):
 
         x = torch.cat([x_train, x_test], dim=0)
         y = torch.cat([y_train, y_test], dim=0).squeeze(-1)
-        adj = graph_info["adj"] 
-        density = graph_info["density"]
 
         if self.return_extra_info:
-            scm = self.prep_scm(graph_info["scm"], graph_info["ordered_nodes"])
             # scm = graph_info["scm"]
-            processor = graph_info["processor"]
             extra_info = dict(
-                scm = scm,
-                adj = adj,
-                density = density,
-                processor = processor,
+                graph_full = self.prep_scm(graph_info["graph_full"], graph_info["ordered_nodes"]),
+                graph_moma = self.prep_scm(graph_info["graph_moma"], graph_info["ordered_nodes"], add_layers=False),
+                adj_full = graph_info["adj_full"],
+                adj_moma = graph_info["adj_moma"],
+                graph_moral = self.prep_scm(graph_info["graph_moral"], graph_info["ordered_nodes"], add_layers=False),
+                density_moma = graph_info["density_moma"],
+                processor = graph_info["processor"],
                 graph_info = graph_info,
             )
         else:
@@ -401,11 +401,14 @@ class GCFMDataLoader(DataLoader):
         }
         batch["target_y"] = batch["y"]  # downstream compatibility
         batch["single_eval_pos"] = single_eval_positions[0]
-        batch["scm"] = [d["scm"] for d in dicts]
+        batch["graph_full"] = [d["graph_full"] for d in dicts]
+        batch["graph_moma"] = [d["graph_moma"] for d in dicts]
+        batch["graph_moral"] = [d["graph_moral"] for d in dicts]
         batch["processor"] = [d["processor"] for d in dicts]
         batch["graph_info"] = [d["graph_info"] for d in dicts]
-        batch["adj"] = torch.stack([d["adj"] for d in dicts]).to(self.device)
-        batch["density"] = torch.tensor([d["density"] for d in dicts], device=self.device)
+        batch["adj_full"] = torch.stack([d["adj_full"] for d in dicts]).to(self.device)
+        batch["adj_moma"] = torch.stack([d["adj_moma"] for d in dicts]).to(self.device)
+        batch["density_moma"] = torch.tensor([d["density_moma"] for d in dicts], device=self.device)
 
         return batch
 
