@@ -71,7 +71,7 @@ def get_openml_datasets(
         max_features_eval: int | None,
         new_instances_eval: int | None,
         target_classes_filter: int | None,
-        eval_subsample_features: int | None,
+        eval_subsample_features: List[int] | int | None,
         eval_subsample_samples: int | None,
         seed: int = 0,
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -86,9 +86,12 @@ def get_openml_datasets(
         Maximum number of instances to keep via stratified subsampling. None = no subsampling.
     target_classes_filter : int | None
         Maximum number of target classes (0 = regression). None = no filter.
-    eval_subsample_features : int | None
-        If set and the dataset has more features than this value, randomly
+    eval_subsample_features : List[int] | int | None
+        If a single int and the dataset has more features than this value, randomly
         subsample down to this many features (seeded).
+        If a list of ints, the dataset is subsampled for each value in the list and
+        stored under the key f"{dataset.name}_nfeat{n}" for each n. Datasets with
+        fewer features than a given n are skipped for that n.
     eval_subsample_samples : int | None
         If set and the dataset has more rows than this value, stratified-
         subsample down to this many rows (seeded).
@@ -111,6 +114,17 @@ def get_openml_datasets(
 
     classification: bool = target_classes_filter is None or target_classes_filter > 0
 
+    # Normalise eval_subsample_features into a list of (n_features, key_suffix) pairs.
+    # - None          → [(None, "")]          one pass, no suffix, no subsampling
+    # - int           → [(n,    "")]          one pass, no suffix, subsample if needed
+    # - List[int]     → [(n, f"_nfeat{n}")]  one pass per value, always suffixed
+    if isinstance(eval_subsample_features, list):
+        subsample_plan: list[tuple[int | None, str]] = [
+            (n, f"-nfeat{n}") for n in eval_subsample_features
+        ]
+    else:
+        subsample_plan = [(eval_subsample_features, "")]
+
     datasets = {}
     for task_counter, task_id in enumerate(task_ids):
         task = openml.tasks.get_task(task_id, download_splits=False)
@@ -125,56 +139,65 @@ def get_openml_datasets(
 
         # ── quality filter ──────────────────────────────────────────────────
         q = dataset.qualities
-        if max_features_eval is not None and q["NumberOfFeatures"] > max_features_eval:
-            continue
-        if new_instances_eval is not None and q["NumberOfInstances"] > new_instances_eval:
-            continue
-        if target_classes_filter is not None and q["NumberOfClasses"] > target_classes_filter:
-            continue
-        if dataset.qualities["MinorityClassPercentage"] <= 2.5:
+        if (
+            (max_features_eval is not None and q["NumberOfFeatures"] > max_features_eval)
+            or (new_instances_eval is not None and q["NumberOfInstances"] > new_instances_eval)
+            or (target_classes_filter is not None and q["NumberOfClasses"] > target_classes_filter)
+        ):
             continue
 
-        X, y, categorical_indicator, attribute_names = dataset.get_data(
+        X_raw, y_raw, categorical_indicator, attribute_names = dataset.get_data(
             target=task.target_name, dataset_format="dataframe"
         )
 
-        # ── feature subsampling ─────────────────────────────────────────────
-        len_features = X.shape[1]
-        if eval_subsample_features is not None and len_features > eval_subsample_features:
-            rng = np.random.default_rng(seed)
-            feature_choices = rng.choice(len_features, size=eval_subsample_features, replace=False)
-            X = X.iloc[:, feature_choices]
-
-        # ── row subsampling ─────────────────────────────────────────────────
-        if eval_subsample_samples is not None and eval_subsample_samples < len(y):
-            y_stratify_sub = y if classification else pd.qcut(y, q=5, labels=False, duplicates="drop")
-            _, X, _, y = train_test_split(
-                X, y,
+        # ── row subsampling (shared across all feature subsample variants) ──
+        if eval_subsample_samples is not None and eval_subsample_samples < len(y_raw):
+            y_stratify_sub = y_raw if classification else pd.qcut(y_raw, q=5, labels=False, duplicates="drop")
+            _, X_raw, _, y_raw = train_test_split(
+                X_raw, y_raw,
                 test_size=eval_subsample_samples,
                 stratify=y_stratify_sub,
                 random_state=seed,
             )
-            X = X.reset_index(drop=True)
-            y = y.reset_index(drop=True)
+            X_raw = X_raw.reset_index(drop=True)
+            y_raw = y_raw.reset_index(drop=True)
 
-        # ── preprocessing & encoding ────────────────────────────────────────
-        X = X.to_numpy(copy=True)
-        y = y.to_numpy(copy=True)
-
+        # ── encode y once (shared across all feature subsample variants) ────
+        y_np = y_raw.to_numpy(copy=True)
         if classification:
             label_encoder = LabelEncoder()
-            y = label_encoder.fit_transform(y)
+            y_np = label_encoder.fit_transform(y_np)
         else:
             target_scaler = StandardScaler()
-            y = target_scaler.fit_transform(y.reshape(-1, 1)).reshape(-1)
+            y_np = target_scaler.fit_transform(y_np.reshape(-1, 1)).reshape(-1)
 
-        preprocessor = get_feature_preprocessor(X)
-        X = preprocessor.fit_transform(X)
+        # ── feature subsampling plan ────────────────────────────────────────
+        len_features = X_raw.shape[1]
 
-        datasets[dataset.name] = (X, y)
+        for n_features, key_suffix in subsample_plan:
+            if n_features is not None and len_features < n_features:
+                if key_suffix:  # list mode — skip silently
+                    print(f'skipping {dataset.name}{key_suffix}\n\t{len_features = } features < {n_features = } requested')
+                    continue
+                # scalar mode — fall through without subsampling (original behaviour)
+                X_sub = X_raw.copy()
+            elif n_features is not None:
+                rng = np.random.default_rng(seed)
+                feature_choices = rng.choice(len_features, size=n_features, replace=False)
+                X_sub = X_raw.iloc[:, feature_choices]
+            else:
+                X_sub = X_raw.copy()
 
-    task_counter += 1
+            # ── preprocessing & encoding ────────────────────────────────────
+            X_np = X_sub.to_numpy(copy=True)
+            preprocessor = get_feature_preprocessor(X_np)
+            X_np = preprocessor.fit_transform(X_np)
+
+            key = f"{dataset.name}{key_suffix}"
+            datasets[key] = (X_np, y_np)
+
     return datasets
+
 
 
 """
@@ -345,7 +368,7 @@ def plot_run_grid(runs: list[pd.DataFrame], baselines: pd.DataFrame = None, base
 def get_baseline_results(
     open_ml_datasets_kwargs: dict,
     num_seeds: int = 1,
-    include_tabpfn: bool = False,
+    include_tabpfn: bool = True,
 ) -> Tuple[Dict[str, Tuple[torch.Tensor, torch.Tensor]], pd.DataFrame, pd.DataFrame]:
     """
     Reproducing the training and evalaution of the NanoTabPFNPlayground paper notebook.
@@ -357,20 +380,19 @@ def get_baseline_results(
     classification = open_ml_datasets_kwargs['target_classes_filter'] > 0
 
     if include_tabpfn:
-        raise NotImplementedError
-        # from tabpfn import TabPFNClassifier
-        # from tabpfn.config import ModelInterfaceConfig, PreprocessorConfig
+        from tabpfn import TabPFNClassifier
+        from tabpfn.config import ModelInterfaceConfig, PreprocessorConfig
 
 
-        # no_preprocessing_inference_config = ModelInterfaceConfig(
-        #     FINGERPRINT_FEATURE=False,
-        #     PREPROCESS_TRANSFORMS=[PreprocessorConfig(name='none')]
-        # )
+        no_preprocessing_inference_config = ModelInterfaceConfig(
+            FINGERPRINT_FEATURE=False,
+            PREPROCESS_TRANSFORMS=[PreprocessorConfig(name='none')]
+        )
 
     if classification:
         baseline_models = {
-            # "TabPFN v2": [TabPFNClassifier(random_state=i) for i in range(NUM_SEEDS)],
-            # "TabPFN v2 (no preprocessing)": [TabPFNClassifier(inference_config=no_preprocessing_inference_config, n_estimators=1, random_state=i) for i in range(NUM_SEEDS)],
+            "TabPFN v2": [TabPFNClassifier(random_state=i) for i in range(NUM_SEEDS)],
+            "TabPFN v2 (no preprocessing)": [TabPFNClassifier(inference_config=no_preprocessing_inference_config, n_estimators=1, random_state=i) for i in range(NUM_SEEDS)],
             "Random Forest": [RandomForestClassifier(random_state=i) for i in range(NUM_SEEDS)],
             "K-Nearest Neighbors": [KNeighborsClassifier()],
             "Decision Tree": [DecisionTreeClassifier(random_state=i) for i in range(NUM_SEEDS)],
