@@ -73,7 +73,9 @@ def get_openml_datasets(
         target_classes_filter: int | None,
         eval_subsample_features: List[int] | int | None,
         eval_subsample_samples: int | None,
+        tabarena_light: bool,
         seed: int = 0,
+        test_fraction: float = 1/3, # following TabArena's ~0.33 test fraction across datasets
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """
     Load OpenML tabarena datasets with optional feature and row subsampling.
@@ -93,14 +95,21 @@ def get_openml_datasets(
         stored under the key f"{dataset.name}_nfeat{n}" for each n. Datasets with
         fewer features than a given n are skipped for that n.
     eval_subsample_samples : int | None
-        If set and the dataset has more rows than this value, stratified-
-        subsample down to this many rows (seeded).
+        If set, the test split is subsampled to at most this many rows. The train
+        split is subsampled proportionally using the fixed ~0.33 test fraction
+        (i.e. train cap = eval_subsample_samples * 2), both via stratified subsampling.
+    tabarena_light : bool
+        If True, use 1 repeat and 1 fold (fast). If False, use 10 repeats and 3 folds
+        (full TabArena evaluation protocol). Keys include a repeat/fold suffix only
+        when tabarena_light=False.
     seed : int
         Global random seed used for all stochastic operations.
 
     Returns
     -------
-    dict mapping dataset name -> (X, y) as numpy arrays.
+    dict mapping dataset name -> (X_train, y_train, X_test, y_test) as numpy arrays.
+    When tabarena_light=False, keys are "{dataset_name}_repeat{r}_fold{f}{feature_suffix}".
+    When tabarena_light=True, keys are "{dataset_name}{feature_suffix}".
     """
     task_ids = [
         363612, 363613, 363614, 363615, 363616, 363618, 363619, 363620,
@@ -111,6 +120,8 @@ def get_openml_datasets(
         363698, 363699, 363700, 363702, 363704, 363705, 363706, 363707,
         363708, 363711, 363712,
     ]  # TabArena v0.1
+
+    n_repeats, n_folds = (1, 1) if tabarena_light else (10, 3)
 
     classification: bool = target_classes_filter is None or target_classes_filter > 0
 
@@ -124,6 +135,24 @@ def get_openml_datasets(
         ]
     else:
         subsample_plan = [(eval_subsample_features, "")]
+
+    def _subsample_split(
+        X: pd.DataFrame,
+        y: pd.Series,
+        max_samples: int,
+        split_seed: int,
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        """Stratified row subsampling, applied only when needed."""
+        if max_samples >= len(y):
+            return X, y
+        y_stratify = y if classification else pd.qcut(y, q=5, labels=False, duplicates="drop")
+        _, X_sub, _, y_sub = train_test_split(
+            X, y,
+            test_size=max_samples,
+            stratify=y_stratify,
+            random_state=split_seed,
+        )
+        return X_sub.reset_index(drop=True), y_sub.reset_index(drop=True)
 
     datasets = {}
     for task_counter, task_id in enumerate(task_ids):
@@ -146,57 +175,84 @@ def get_openml_datasets(
         ):
             continue
 
-        X_raw, y_raw, categorical_indicator, attribute_names = dataset.get_data(
+        # ── load full data once per dataset ─────────────────────────────────
+        X_full, y_full, categorical_indicator, attribute_names = dataset.get_data(
             target=task.target_name, dataset_format="dataframe"
         )
 
-        # ── row subsampling (shared across all feature subsample variants) ──
-        if eval_subsample_samples is not None and eval_subsample_samples < len(y_raw):
-            y_stratify_sub = y_raw if classification else pd.qcut(y_raw, q=5, labels=False, duplicates="drop")
-            _, X_raw, _, y_raw = train_test_split(
-                X_raw, y_raw,
-                test_size=eval_subsample_samples,
-                stratify=y_stratify_sub,
-                random_state=seed,
-            )
-            X_raw = X_raw.reset_index(drop=True)
-            y_raw = y_raw.reset_index(drop=True)
+        for repeat in range(n_repeats):
+            for fold in range(n_folds):
 
-        # ── encode y once (shared across all feature subsample variants) ────
-        y_np = y_raw.to_numpy(copy=True)
-        if classification:
-            label_encoder = LabelEncoder()
-            y_np = label_encoder.fit_transform(y_np)
-        else:
-            target_scaler = StandardScaler()
-            y_np = target_scaler.fit_transform(y_np.reshape(-1, 1)).reshape(-1)
+                # Use a deterministic seed that varies per repeat/fold
+                split_seed = seed + repeat * n_folds + fold
 
-        # ── feature subsampling plan ────────────────────────────────────────
-        len_features = X_raw.shape[1]
+                # ── train/test split via OpenML indices ──────────────────────
+                train_indices, test_indices = task.get_train_test_split_indices(
+                    fold=fold, repeat=repeat
+                )
 
-        for n_features, key_suffix in subsample_plan:
-            if n_features is not None and len_features < n_features:
-                if key_suffix:  # list mode — skip silently
-                    print(f'skipping {dataset.name}{key_suffix}\n\t{len_features = } features < {n_features = } requested')
-                    continue
-                # scalar mode — fall through without subsampling (original behaviour)
-                X_sub = X_raw.copy()
-            elif n_features is not None:
-                rng = np.random.default_rng(seed)
-                feature_choices = rng.choice(len_features, size=n_features, replace=False)
-                X_sub = X_raw.iloc[:, feature_choices]
-            else:
-                X_sub = X_raw.copy()
+                X_train = X_full.iloc[train_indices].reset_index(drop=True)
+                y_train = y_full.iloc[train_indices].reset_index(drop=True)
+                X_test  = X_full.iloc[test_indices].reset_index(drop=True)
+                y_test  = y_full.iloc[test_indices].reset_index(drop=True)
 
-            # ── preprocessing & encoding ────────────────────────────────────
-            X_np = X_sub.to_numpy(copy=True)
-            preprocessor = get_feature_preprocessor(X_np)
-            X_np = preprocessor.fit_transform(X_np)
+                # ── row subsampling on both splits ───────────────────────────
+                if eval_subsample_samples is not None:
+                    test_max  = round(eval_subsample_samples * test_fraction)
+                    train_max = eval_subsample_samples - test_max  # guarantees exact total
+                    X_test,  y_test  = _subsample_split(X_test,  y_test,  test_max,  split_seed)
+                    X_train, y_train = _subsample_split(X_train, y_train, train_max, split_seed)
 
-            key = f"{dataset.name}{key_suffix}"
-            datasets[key] = (X_np, y_np)
+
+                # ── encode y once (shared across all feature subsample variants)
+                def _encode_y(y: pd.Series) -> np.ndarray:
+                    y_np = y.to_numpy(copy=True)
+                    if classification:
+                        return LabelEncoder().fit_transform(y_np)
+                    else:
+                        return StandardScaler().fit_transform(y_np.reshape(-1, 1)).reshape(-1)
+
+                y_train_np = _encode_y(y_train)
+                y_test_np  = _encode_y(y_test)
+
+                # ── feature subsampling plan ─────────────────────────────────
+                len_features = X_train.shape[1]
+
+                for n_features, key_suffix in subsample_plan:
+                    if n_features is not None and len_features < n_features:
+                        if key_suffix:  # list mode — skip silently
+                            print(
+                                f"skipping {dataset.name}{key_suffix}\n"
+                                f"\t{len_features = } features < {n_features = } requested"
+                            )
+                            continue
+                        # scalar mode — fall through without subsampling
+                        X_train_sub = X_train.copy()
+                        X_test_sub  = X_test.copy()
+                    elif n_features is not None:
+                        rng = np.random.default_rng(seed)
+                        feature_choices = rng.choice(len_features, size=n_features, replace=False)
+                        X_train_sub = X_train.iloc[:, feature_choices]
+                        X_test_sub  = X_test.iloc[:, feature_choices]
+                    else:
+                        X_train_sub = X_train.copy()
+                        X_test_sub  = X_test.copy()
+
+                    # ── preprocessing & encoding ─────────────────────────────
+                    # Fit preprocessor on train, apply to both splits
+                    X_train_np = X_train_sub.to_numpy(copy=True)
+                    X_test_np  = X_test_sub.to_numpy(copy=True)
+                    preprocessor = get_feature_preprocessor(X_train_np)
+                    X_train_np = preprocessor.fit_transform(X_train_np)
+                    X_test_np  = preprocessor.transform(X_test_np)
+
+                    # ── build key ────────────────────────────────────────────
+                    # split_suffix = f"_repeat{repeat}_fold{fold}"
+                    key = (f"{dataset.name}{key_suffix}", repeat, fold)
+                    datasets[key] = (X_train_np, y_train_np, X_test_np, y_test_np)
 
     return datasets
+
 
 
 
@@ -205,7 +261,7 @@ def get_openml_datasets(
 """
 
 
-def eval_model(model, datasets, classification: bool):
+def _eval_model(model, datasets, classification: bool):
     """Evaluates a model on multiple datasets and returns metrics"""
     _skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
     metrics = {}
@@ -238,6 +294,45 @@ def eval_model(model, datasets, classification: bool):
         else:
             metrics[f"{dataset_name}/rmse"] = root_mean_squared_error(targets, probabilities)
     
+    metric_names = list({key.split("/")[-1] for key in metrics.keys()})
+    for metric_name in metric_names:
+        avg_metric = np.mean([metrics[key] for key in metrics.keys() if key.endswith(metric_name)])
+        avg_metrics[f"{metric_name}"] = float(avg_metric)
+    
+    return metrics, avg_metrics
+
+def eval_model(model, datasets, classification: bool):
+    """Evaluates a model on multiple datasets and returns metrics"""
+    metrics = {}
+    avg_metrics = {}
+    for (dataset_name, repeat, fold), (X_train, y_train, X_test, y_test) in tqdm(datasets.items(), desc=f"Evaluating {model}", total=len(datasets), leave=False):
+        model.fit(X_train, y_train)
+        if classification:
+            y_proba = model.predict_proba(X_test)
+            if y_proba.shape[1] == 2:  # binary classification with neural network
+                y_proba = y_proba[:, 1]
+            else:
+                raise NotImplementedError("Only binary classification with predict_proba output of shape (n_samples, 2) is currently supported.")
+        else:
+            y_pred = model.predict(X_test)
+
+        if classification:
+            score = roc_auc_score(y_test, y_proba, multi_class="ovr")
+            metric = 'roc_auc'
+        else:
+            score = root_mean_squared_error(y_test, y_pred)
+            metric = 'rmse'
+
+        # metrics[f"{dataset_name}/repeat{repeat}_fold{fold}/{metric}"] = score
+        metrics[(dataset_name, repeat, fold, metric)] = score
+
+    df_score = pd.DataFrame(
+        [(dataset, repeat, fold, metric, value) for (dataset, repeat, fold, metric), value in metrics.items()],
+        columns=['dataset', 'repeat', 'fold', 'metric', 'metric_value']
+    )
+
+    return df_score
+
     metric_names = list({key.split("/")[-1] for key in metrics.keys()})
     for metric_name in metric_names:
         avg_metric = np.mean([metrics[key] for key in metrics.keys() if key.endswith(metric_name)])
@@ -366,18 +461,18 @@ def plot_run_grid(runs: list[pd.DataFrame], baselines: pd.DataFrame = None, base
     return fig, axs
 
 def get_baseline_results(
-    open_ml_datasets_kwargs: dict,
-    num_seeds: int = 1,
+    # open_ml_datasets_kwargs: dict,
+    datasets: dict,
+    classification: bool,
+    num_seeds: int = 1,  # If you want to reproduce the paper results, use 20 seeds
     include_tabpfn: bool = True,
 ) -> Tuple[Dict[str, Tuple[torch.Tensor, torch.Tensor]], pd.DataFrame, pd.DataFrame]:
     """
     Reproducing the training and evalaution of the NanoTabPFNPlayground paper notebook.
     """
-    NUM_SEEDS = num_seeds
-    # NUM_SEEDS = 20 # If you want to reproduce the paper results, use 20 seeds
-    datasets = get_openml_datasets(**open_ml_datasets_kwargs)
+    # datasets = get_openml_datasets(**open_ml_datasets_kwargs)
 
-    classification = open_ml_datasets_kwargs['target_classes_filter'] > 0
+    # classification = open_ml_datasets_kwargs['target_classes_filter'] > 0
 
     if include_tabpfn:
         from tabpfn import TabPFNClassifier
@@ -391,23 +486,33 @@ def get_baseline_results(
 
     if classification:
         baseline_models = {
-            "TabPFN v2": [TabPFNClassifier(random_state=i) for i in range(NUM_SEEDS)],
-            "TabPFN v2 (no preprocessing)": [TabPFNClassifier(inference_config=no_preprocessing_inference_config, n_estimators=1, random_state=i) for i in range(NUM_SEEDS)],
-            "Random Forest": [RandomForestClassifier(random_state=i) for i in range(NUM_SEEDS)],
-            "K-Nearest Neighbors": [KNeighborsClassifier()],
-            "Decision Tree": [DecisionTreeClassifier(random_state=i) for i in range(NUM_SEEDS)],
-            "Linear" : [LogisticRegression(max_iter=1000, ) for i in range(NUM_SEEDS)],
+            # "TabPFN v2": [TabPFNClassifier(random_state=i) for i in range(num_seeds)],
+            # "TabPFN v2 (no preprocessing)": [TabPFNClassifier(inference_config=no_preprocessing_inference_config, n_estimators=1, random_state=i) for i in range(num_seeds)],
+            "Random Forest": [RandomForestClassifier(random_state=i) for i in range(num_seeds)],
+            # "K-Nearest Neighbors": [KNeighborsClassifier()],
+            "Decision Tree": [DecisionTreeClassifier(random_state=i) for i in range(num_seeds)],
+            # "Linear" : [LogisticRegression(max_iter=1000, ) for i in range(num_seeds)],
         }
     else:
         baseline_models = {
-            # "TabPFN v2": [TabPFNRegressor(random_state=i) for i in range(NUM_SEEDS)],
-            # "Random Forest": [RandomForestRegressor(random_state=i) for i in range(NUM_SEEDS)],
+            # "TabPFN v2": [TabPFNRegressor(random_state=i) for i in range(num_seeds)],
+            # "Random Forest": [RandomForestRegressor(random_state=i) for i in range(num_seeds)],
             # "K-Nearest Neighbors": [KNeighborsRegressor()],
-            "Decision Tree": [DecisionTreeRegressor(random_state=i) for i in range(NUM_SEEDS)],
+            "Decision Tree": [DecisionTreeRegressor(random_state=i) for i in range(num_seeds)],
             # "Linear" : [LinearRegression()],
         }
 
-    baseline_models_eval = {name: [eval_model(model, datasets=datasets, classification=classification)[0] for model in models] for name, models in baseline_models.items()}
+    df_scores = []
+    for name, models in baseline_models.items():
+        for seed, model in enumerate(models):
+            df_score = eval_model(model, datasets=datasets, classification=classification)
+            df_score['method'] = name
+            df_score['seed'] = seed
+            df_scores.append(df_score)
+    df_scores = pd.concat(df_scores, ignore_index=True)
+    return df_scores
+
+    baseline_models_eval = {name: [eval_model(model, datasets=datasets, classification=classification) for model in models] for name, models in baseline_models.items()}
 
     def apply_aggregation(eval_results: dict, func=np.mean):
         aggregated_result = {}
