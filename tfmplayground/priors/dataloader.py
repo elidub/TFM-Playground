@@ -369,6 +369,14 @@ class GCFMDataLoader(DataLoader):
                 density_moma = graph_info["density_moma"],
                 processor = graph_info["processor"],
                 graph_info = graph_info,
+                # Target-selection diagnostics (None for non-Reg2Cls processors).
+                node_variances = graph_info.get("node_variances"),
+                node_depths = graph_info.get("node_depths"),
+                target_node = graph_info.get("target_node"),
+                target_depth = graph_info.get("target_depth"),
+                target_variance = graph_info.get("target_variance"),
+                eligible_pool_size = graph_info.get("eligible_pool_size"),
+                n_rejections = graph_info.get("n_rejections"),
             )
         else:
             extra_info = dict()
@@ -409,6 +417,12 @@ class GCFMDataLoader(DataLoader):
         batch["adj_full"] = torch.stack([d["adj_full"] for d in dicts]).to(self.device)
         batch["adj_moma"] = torch.stack([d["adj_moma"] for d in dicts]).to(self.device)
         batch["density_moma"] = torch.tensor([d["density_moma"] for d in dicts], device=self.device)
+
+        # Target-selection diagnostics — kept as per-sample lists (per-node arrays are
+        # ragged across datasets, so they are not stacked into tensors).
+        for k in ("node_variances", "node_depths", "target_node", "target_depth",
+                  "target_variance", "eligible_pool_size", "n_rejections"):
+            batch[k] = [d.get(k) for d in dicts]
 
         return batch
 
@@ -457,7 +471,10 @@ class GCFMTabICLDataLoader(GCFMDataLoader):
             device=device,
             return_extra_info=True,
             processor_class=Reg2ClsProcessor,
-            processor_kwargs={"tabicl_hp": config.get("tabicl_hp")},
+            processor_kwargs={
+                "tabicl_hp": config.get("tabicl_hp"),
+                "target_selection_rule": config.get("target_selection_rule", "uniform"),
+            },
         )
 
 

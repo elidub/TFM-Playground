@@ -42,12 +42,20 @@ def dump_prior_to_h5(
     batch_size: int, 
     save_path: str, 
     problem_type: str, 
-    max_seq_len: int, 
+    max_seq_len: int,
     max_features: int,
     save_graph_info: bool = False,
+    save_diagnostics: bool = False,
     resume: bool = False,
 ):
-    """Dumps synthetic prior data into an HDF5 file for later training."""
+    """Dumps synthetic prior data into an HDF5 file for later training.
+
+    If ``save_diagnostics`` is True (gcfm_tabicl path), the target-selection
+    diagnostics are persisted alongside X/y: per-node marginal variance and
+    topological depth (ragged, full graph length), the selected target's id /
+    depth / variance, the rule's eligible-pool size, the per-dataset rejection
+    count, and the full-graph adjacency (flattened, ragged) for varsortability.
+    """
 
     with h5py.File(save_path, "w") as f:
         dump_X = f.create_dataset(
@@ -80,6 +88,40 @@ def dump_prior_to_h5(
             )
             dump_density = f.create_dataset(
                 "density", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype="f4"
+            )
+
+        if save_diagnostics:
+            vlen_f4 = h5py.special_dtype(vlen=np.dtype("f4"))
+            vlen_i4 = h5py.special_dtype(vlen=np.dtype("i4"))
+            # Ragged, full-graph-length per-node arrays.
+            dump_node_variances = f.create_dataset(
+                "node_variances", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype=vlen_f4
+            )
+            dump_node_depths = f.create_dataset(
+                "node_depths", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype=vlen_i4
+            )
+            # Full-graph adjacency, flattened row-major (reshape with num_nodes on read).
+            dump_adj_full = f.create_dataset(
+                "adj_full_flat", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype=vlen_f4
+            )
+            # Per-dataset scalars.
+            dump_num_nodes = f.create_dataset(
+                "num_nodes", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype="i4"
+            )
+            dump_target_node = f.create_dataset(
+                "target_node", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype="i4"
+            )
+            dump_target_depth = f.create_dataset(
+                "target_depth", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype="i4"
+            )
+            dump_target_variance = f.create_dataset(
+                "target_variance", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype="f4"
+            )
+            dump_eligible_pool_size = f.create_dataset(
+                "eligible_pool_size", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype="i4"
+            )
+            dump_n_rejections = f.create_dataset(
+                "n_rejections", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype="i4"
             )
 
         if problem_type == "classification" and max_classes is not None:
@@ -120,11 +162,30 @@ def dump_prior_to_h5(
             dump_single_eval_pos[-batch_size:] = single_eval_pos
 
             if save_graph_info:
-                dump_adj.resize(dump_adj.shape[0] + batch_size, axis=0) 
+                dump_adj.resize(dump_adj.shape[0] + batch_size, axis=0)
                 dump_adj[-batch_size:] = adj
 
                 dump_density.resize(dump_density.shape[0] + batch_size, axis=0)
                 dump_density[-batch_size:] = density
+
+            if save_diagnostics:
+                node_variances = e["node_variances"]      # list[batch] of per-node lists
+                node_depths = e["node_depths"]
+                adj_full = e["adj_full"].to("cpu").numpy()  # (batch, n, n) — n constant within a batch
+
+                def _resize_append(ds, values):
+                    ds.resize(ds.shape[0] + batch_size, axis=0)
+                    ds[-batch_size:] = values
+
+                _resize_append(dump_node_variances, [np.asarray(v, dtype="f4") for v in node_variances])
+                _resize_append(dump_node_depths, [np.asarray(d, dtype="i4") for d in node_depths])
+                _resize_append(dump_adj_full, [adj_full[i].astype("f4").ravel() for i in range(batch_size)])
+                _resize_append(dump_num_nodes, [len(v) for v in node_variances])
+                _resize_append(dump_target_node, e["target_node"])
+                _resize_append(dump_target_depth, e["target_depth"])
+                _resize_append(dump_target_variance, e["target_variance"])
+                _resize_append(dump_eligible_pool_size, e["eligible_pool_size"])
+                _resize_append(dump_n_rejections, e["n_rejections"])
 
             # Periodic flush for crash safety
             if (batch_idx + 1) % 50 == 0:
