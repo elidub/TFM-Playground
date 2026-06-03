@@ -313,6 +313,7 @@ class GCFMDataLoader(DataLoader):
         extra_checks: bool = False,
         processor_class=None,
         processor_kwargs: Optional[Dict[str, Any]] = None,
+        seed: Optional[int] = None,
     ):
         self.batch_size = batch_size
         self.num_steps = num_steps
@@ -325,7 +326,7 @@ class GCFMDataLoader(DataLoader):
             scm_config=config["scm_config"],
             preprocessing_config=config.get("preprocessing_config"),
             dataset_config=config["dataset_config"],
-            seed=None,
+            seed=seed,
             processor_class=processor_class,
             processor_kwargs=processor_kwargs,
         )
@@ -463,6 +464,7 @@ class GCFMTabICLDataLoader(GCFMDataLoader):
         batch_size: int,
         num_steps: int,
         device: torch.device,
+        seed: Optional[int] = None,
     ):
         super().__init__(
             config=config,
@@ -475,6 +477,7 @@ class GCFMTabICLDataLoader(GCFMDataLoader):
                 "tabicl_hp": config.get("tabicl_hp"),
                 "target_selection_rule": config.get("target_selection_rule", "uniform"),
             },
+            seed=seed,
         )
 
 
