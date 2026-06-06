@@ -476,6 +476,10 @@ class GCFMTabICLDataLoader(GCFMDataLoader):
             processor_kwargs={
                 "tabicl_hp": config.get("tabicl_hp"),
                 "target_selection_rule": config.get("target_selection_rule", "uniform"),
+                "band_fraction": config.get("band_fraction", 0.10),
+                "depth_temperature": config.get("depth_temperature", 1.0),
+                "depth_coupling_clean_at": config.get("depth_coupling_clean_at", None),
+                "feature_selection": config.get("feature_selection", "random"),
             },
             seed=seed,
         )
