@@ -480,6 +480,7 @@ class GCFMTabICLDataLoader(GCFMDataLoader):
                 "depth_temperature": config.get("depth_temperature", 1.0),
                 "depth_coupling_clean_at": config.get("depth_coupling_clean_at", None),
                 "feature_selection": config.get("feature_selection", "random"),
+                "noise_feature_fraction": config.get("noise_feature_fraction", 0.0),
             },
             seed=seed,
         )
