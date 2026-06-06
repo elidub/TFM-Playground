@@ -64,10 +64,18 @@ class PriorDumpDataLoader(DataLoader):
         batch_size (int): Batch size.
         device (torch.device): Device to load tensors onto.
     """
-    def __init__(self, filename, num_steps, batch_size, device, starting_index=0):
+    def __init__(self, filename, num_steps, batch_size, device, starting_index=0,
+                 randomize_split=False, min_eval_pos=16, min_test=16, split_seed=0):
         self.filename = filename
         self.num_steps = num_steps
         self.batch_size = batch_size
+        # Randomize the context/query split point per batch so the model trains on variable
+        # context sizes (robust to any eval context). Rows are i.i.d. (exchangeable), so any
+        # split is valid. One scalar per batch (downstream assumes a single split per batch).
+        self.randomize_split = randomize_split
+        self.min_eval_pos = min_eval_pos   # min context (train) rows
+        self.min_test = min_test           # min query (test) rows
+        self._split_rng = np.random.default_rng(split_seed)
         with h5py.File(self.filename, "r", swmr=True) as f:
             self.num_datapoints_max = f['X'].shape[0]
             if "max_num_classes" in f:
@@ -101,6 +109,12 @@ class PriorDumpDataLoader(DataLoader):
                     # adj = remove_axis(adj, list(range(num_features, adj.shape[1] - 1)))
 
                 single_eval_pos = f["single_eval_pos"][self.pointer : end]
+                if self.randomize_split:
+                    # draw one split per batch in [min_eval_pos, max_seq_in_batch - min_test]
+                    hi = max(self.min_eval_pos + 1, max_seq_in_batch - self.min_test)
+                    sep = int(self._split_rng.integers(self.min_eval_pos, hi))
+                else:
+                    sep = int(single_eval_pos[0])
 
                 self.pointer += self.batch_size
                 if self.pointer >= f["X"].shape[0]:
@@ -114,8 +128,9 @@ class PriorDumpDataLoader(DataLoader):
                     x=x.to(self.device),
                     y=y.to(self.device),
                     target_y=y.to(self.device),  # target_y is identical to y (for downstream compatibility)
-                    # Warning! Current code assumes that single_eval_pos is the same for all datasets in the batch, which should be the case if the data was generated with batch_size_per_gp=batch_size. If this is not the case, we will just take the single_eval_pos of the first dataset in the batch, which may lead to unexpected behaviour.
-                    single_eval_pos=single_eval_pos[0].item(),
+                    # One split per batch (downstream assumes a single scalar). Either the
+                    # stored value or a per-batch random draw (randomize_split=True).
+                    single_eval_pos=sep,
                     # adj=adj.to(self.device),
                     adj = None,
                 )
