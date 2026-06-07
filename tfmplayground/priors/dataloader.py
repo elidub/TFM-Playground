@@ -69,9 +69,7 @@ class PriorDumpDataLoader(DataLoader):
         self.filename = filename
         self.num_steps = num_steps
         self.batch_size = batch_size
-        # Randomize the context/query split point per batch so the model trains on variable
-        # context sizes (robust to any eval context). Rows are i.i.d. (exchangeable), so any
-        # split is valid. One scalar per batch (downstream assumes a single split per batch).
+        # Randomize the context/query split point per batch so the model trains on variable context sizes
         self.randomize_split = randomize_split
         self.min_eval_pos = min_eval_pos   # min context (train) rows
         self.min_test = min_test           # min query (test) rows
