@@ -10,6 +10,7 @@ from sklearn.model_selection import StratifiedKFold
 import seaborn as sns
 import numpy as np
 import openml
+from fractions import Fraction
 import pandas as pd
 from tqdm import tqdm
 from openml.tasks import TaskType
@@ -19,10 +20,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, OrdinalEncoder, FunctionTransformer
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.impute import SimpleImputer
-
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+
+from dotenv import load_dotenv
+load_dotenv()
 """
 =================== DATA LOADING AND PREPROCESSING ===================
 """
@@ -74,8 +77,8 @@ def get_openml_datasets(
         eval_subsample_features: List[int] | int | None,
         eval_subsample_samples: int | None,
         tabarena_light: bool,
-        seed: int = 0,
-        test_fraction: float = 1/3, # following TabArena's ~0.33 test fraction across datasets
+        split_seed: int,
+        test_fraction: float | str,
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """
     Load OpenML tabarena datasets with optional feature and row subsampling.
@@ -102,7 +105,7 @@ def get_openml_datasets(
         If True, use 1 repeat and 1 fold (fast). If False, use 10 repeats and 3 folds
         (full TabArena evaluation protocol). Keys include a repeat/fold suffix only
         when tabarena_light=False.
-    seed : int
+    split_seed : int
         Global random seed used for all stochastic operations.
 
     Returns
@@ -111,6 +114,9 @@ def get_openml_datasets(
     When tabarena_light=False, keys are "{dataset_name}_repeat{r}_fold{f}{feature_suffix}".
     When tabarena_light=True, keys are "{dataset_name}{feature_suffix}".
     """
+    if isinstance(test_fraction, str): # e.g. from '1/3' to 1/3
+        test_fraction = float(Fraction(test_fraction))
+
     task_ids = [
         363612, 363613, 363614, 363615, 363616, 363618, 363619, 363620,
         363621, 363623, 363624, 363625, 363626, 363627, 363628, 363629,
@@ -184,7 +190,7 @@ def get_openml_datasets(
             for fold in range(n_folds):
 
                 # Use a deterministic seed that varies per repeat/fold
-                split_seed = seed + repeat * n_folds + fold
+                split_seed_repeat_fold = split_seed + repeat * n_folds + fold
 
                 # ── train/test split via OpenML indices ──────────────────────
                 train_indices, test_indices = task.get_train_test_split_indices(
@@ -200,8 +206,8 @@ def get_openml_datasets(
                 if eval_subsample_samples is not None:
                     test_max  = round(eval_subsample_samples * test_fraction)
                     train_max = eval_subsample_samples - test_max  # guarantees exact total
-                    X_test,  y_test  = _subsample_split(X_test,  y_test,  test_max,  split_seed)
-                    X_train, y_train = _subsample_split(X_train, y_train, train_max, split_seed)
+                    X_test,  y_test  = _subsample_split(X_test,  y_test,  test_max,  split_seed_repeat_fold)
+                    X_train, y_train = _subsample_split(X_train, y_train, train_max, split_seed_repeat_fold)
 
 
                 # ── encode y once (shared across all feature subsample variants)
@@ -220,6 +226,7 @@ def get_openml_datasets(
 
                 for n_features, key_suffix in subsample_plan:
                     if n_features is not None and len_features < n_features:
+                        raise ValueError(f"Dataset {dataset.name} has only {len_features} features, cannot subsample to {n_features}.")
                         if key_suffix:  # list mode — skip silently
                             print(
                                 f"skipping {dataset.name}{key_suffix}\n"
@@ -230,7 +237,7 @@ def get_openml_datasets(
                         X_train_sub = X_train.copy()
                         X_test_sub  = X_test.copy()
                     elif n_features is not None:
-                        rng = np.random.default_rng(seed)
+                        rng = np.random.default_rng(split_seed_repeat_fold)
                         feature_choices = rng.choice(len_features, size=n_features, replace=False)
                         X_train_sub = X_train.iloc[:, feature_choices]
                         X_test_sub  = X_test.iloc[:, feature_choices]
@@ -305,7 +312,10 @@ def eval_model(model, datasets, classification: bool):
     """Evaluates a model on multiple datasets and returns metrics"""
     metrics = {}
     avg_metrics = {}
-    for (dataset_name, repeat, fold), (X_train, y_train, X_test, y_test) in tqdm(datasets.items(), desc=f"Evaluating {model}", total=len(datasets), leave=False):
+    model_str = repr(model)
+    desc = f"Evaluating {model_str if len(model_str) <= 30 else model_str[:30] + '...'}"
+    for (dataset_name, repeat, fold), (X_train, y_train, X_test, y_test) in tqdm(datasets.items(), 
+    desc=desc, total=len(datasets), leave=False):
         model.fit(X_train, y_train)
         if classification:
             y_proba = model.predict_proba(X_test)
@@ -474,33 +484,43 @@ def get_baseline_results(
 
     # classification = open_ml_datasets_kwargs['target_classes_filter'] > 0
 
-    if include_tabpfn:
-        from tabpfn import TabPFNClassifier
-        from tabpfn.config import ModelInterfaceConfig, PreprocessorConfig
-
-
-        no_preprocessing_inference_config = ModelInterfaceConfig(
-            FINGERPRINT_FEATURE=False,
-            PREPROCESS_TRANSFORMS=[PreprocessorConfig(name='none')]
-        )
 
     if classification:
         baseline_models = {
-            # "TabPFN v2": [TabPFNClassifier(random_state=i) for i in range(num_seeds)],
-            # "TabPFN v2 (no preprocessing)": [TabPFNClassifier(inference_config=no_preprocessing_inference_config, n_estimators=1, random_state=i) for i in range(num_seeds)],
             "Random Forest": [RandomForestClassifier(random_state=i) for i in range(num_seeds)],
-            # "K-Nearest Neighbors": [KNeighborsClassifier()],
+            "K-Nearest Neighbors": [KNeighborsClassifier()], # determistic, no random state
             "Decision Tree": [DecisionTreeClassifier(random_state=i) for i in range(num_seeds)],
-            # "Linear" : [LogisticRegression(max_iter=1000, ) for i in range(num_seeds)],
+            "Linear" : [LogisticRegression(max_iter=1000, random_state=i) for i in range(num_seeds)],
         }
     else:
         baseline_models = {
-            # "TabPFN v2": [TabPFNRegressor(random_state=i) for i in range(num_seeds)],
             # "Random Forest": [RandomForestRegressor(random_state=i) for i in range(num_seeds)],
             # "K-Nearest Neighbors": [KNeighborsRegressor()],
             "Decision Tree": [DecisionTreeRegressor(random_state=i) for i in range(num_seeds)],
             # "Linear" : [LinearRegression()],
         }
+        
+    if include_tabpfn:
+        from tabpfn import TabPFNClassifier
+        from tabpfn.inference_config import InferenceConfig  # renamed from tabpfn.config.ModelInterfaceConfig
+        from tabpfn.preprocessing import PreprocessorConfig
+
+        no_preprocessing_inference_config = InferenceConfig(
+            PREPROCESS_TRANSFORMS=[PreprocessorConfig(name='none')]
+            # FINGERPRINT_FEATURE removed — fingerprinting is now always deterministic
+        )
+
+        if classification:
+            baseline_models = baseline_models | {
+                "TabPFN v2.6": [TabPFNClassifier(random_state=i) for i in range(num_seeds)],
+                "TabPFN v2.6 (no preprocessing)": [TabPFNClassifier(inference_config=no_preprocessing_inference_config, n_estimators=1, random_state=i) for i in range(num_seeds)],
+            }
+        else:
+            from tabpfn import TabPFNRegressor
+            baseline_models = baseline_models | {
+                "TabPFN v2.6": [TabPFNRegressor(random_state=i) for i in range(num_seeds)],
+                "TabPFN v2.6 (no preprocessing)": [TabPFNRegressor(inference_config=no_preprocessing_inference_config, n_estimators=1, random_state=i) for i in range(num_seeds)],
+            }
 
     df_scores = []
     for name, models in baseline_models.items():

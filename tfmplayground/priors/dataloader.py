@@ -401,14 +401,15 @@ class GCFMDataLoader(DataLoader):
         }
         batch["target_y"] = batch["y"]  # downstream compatibility
         batch["single_eval_pos"] = single_eval_positions[0]
-        batch["graph_full"] = [d["graph_full"] for d in dicts]
-        batch["graph_moma"] = [d["graph_moma"] for d in dicts]
-        batch["graph_moral"] = [d["graph_moral"] for d in dicts]
-        batch["processor"] = [d["processor"] for d in dicts]
-        batch["graph_info"] = [d["graph_info"] for d in dicts]
-        batch["adj_full"] = torch.stack([d["adj_full"] for d in dicts]).to(self.device)
-        batch["adj_moma"] = torch.stack([d["adj_moma"] for d in dicts]).to(self.device)
-        batch["density_moma"] = torch.tensor([d["density_moma"] for d in dicts], device=self.device)
+        if self.return_extra_info:
+            batch["graph_full"] = [d["graph_full"] for d in dicts]
+            batch["graph_moma"] = [d["graph_moma"] for d in dicts]
+            batch["graph_moral"] = [d["graph_moral"] for d in dicts]
+            batch["processor"] = [d["processor"] for d in dicts]
+            batch["graph_info"] = [d["graph_info"] for d in dicts]
+            batch["adj_full"] = torch.stack([d["adj_full"] for d in dicts]).to(self.device)
+            batch["adj_moma"] = torch.stack([d["adj_moma"] for d in dicts]).to(self.device)
+            batch["density_moma"] = torch.tensor([d["density_moma"] for d in dicts], device=self.device)
 
         return batch
 
@@ -449,13 +450,14 @@ class GCFMTabICLDataLoader(GCFMDataLoader):
         batch_size: int,
         num_steps: int,
         device: torch.device,
+        return_extra_info: bool,
     ):
         super().__init__(
             config=config,
             batch_size=batch_size,
             num_steps=num_steps,
             device=device,
-            return_extra_info=True,
+            return_extra_info=return_extra_info,
             processor_class=Reg2ClsProcessor,
             processor_kwargs={"tabicl_hp": config.get("tabicl_hp")},
         )
