@@ -4,7 +4,10 @@ import functools
 from sklearn.linear_model import LinearRegression, LogisticRegression
 import torch
 import pandas as pd
-from sklearn.metrics import roc_auc_score, root_mean_squared_error
+from sklearn.metrics import (
+    roc_auc_score, root_mean_squared_error,
+    log_loss, accuracy_score, average_precision_score, brier_score_loss,
+)
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 import seaborn as sns
@@ -146,6 +149,12 @@ def get_openml_datasets(
         if max_samples >= len(y):
             return X, y
         y_stratify = y if classification else pd.qcut(y, q=5, labels=False, duplicates="drop")
+        # train_test_split stratifies BOTH sides, so the discarded complement
+        # (len - max_samples) must hold >= 1 row per stratum. If subsampling would
+        # leave fewer rows than strata, keep all rows rather than crash.
+        n_strata = pd.Series(y_stratify).nunique()
+        if len(y) - max_samples < n_strata:
+            return X.reset_index(drop=True), y.reset_index(drop=True)
         _, X_sub, _, y_sub = train_test_split(
             X, y,
             test_size=max_samples,
@@ -317,14 +326,23 @@ def eval_model(model, datasets, classification: bool):
             y_pred = model.predict(X_test)
 
         if classification:
-            score = roc_auc_score(y_test, y_proba, multi_class="ovr")
-            metric = 'roc_auc'
+            # Full metric suite logged directly (see NanoTabPFNEvaluationLoggerCallback).
+            # 'roc_auc' MUST stay present and first-class: the TabArena leaderboard
+            # downstream filters df_scores to metric == 'roc_auc'.
+            y_hat = (y_proba >= 0.5).astype(int)
+            scored = {
+                'roc_auc': roc_auc_score(y_test, y_proba, multi_class="ovr"),
+                'average_precision': average_precision_score(y_test, y_proba),
+                'accuracy': accuracy_score(y_test, y_hat),
+                'log_loss': log_loss(y_test, y_proba, labels=[0, 1]),
+                'brier_score': brier_score_loss(y_test, y_proba),
+            }
         else:
-            score = root_mean_squared_error(y_test, y_pred)
-            metric = 'rmse'
+            scored = {'rmse': root_mean_squared_error(y_test, y_pred)}
 
         # metrics[f"{dataset_name}/repeat{repeat}_fold{fold}/{metric}"] = score
-        metrics[(dataset_name, repeat, fold, metric)] = score
+        for metric, score in scored.items():
+            metrics[(dataset_name, repeat, fold, metric)] = score
 
     df_score = pd.DataFrame(
         [(dataset, repeat, fold, metric, value) for (dataset, repeat, fold, metric), value in metrics.items()],

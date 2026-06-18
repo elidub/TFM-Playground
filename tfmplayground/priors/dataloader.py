@@ -64,10 +64,16 @@ class PriorDumpDataLoader(DataLoader):
         batch_size (int): Batch size.
         device (torch.device): Device to load tensors onto.
     """
-    def __init__(self, filename, num_steps, batch_size, device, starting_index=0):
+    def __init__(self, filename, num_steps, batch_size, device, starting_index=0,
+                 randomize_split=False, min_eval_pos=16, min_test=16, split_seed=0):
         self.filename = filename
         self.num_steps = num_steps
         self.batch_size = batch_size
+        # Randomize the context/query split point per batch so the model trains on variable context sizes
+        self.randomize_split = randomize_split
+        self.min_eval_pos = min_eval_pos   # min context (train) rows
+        self.min_test = min_test           # min query (test) rows
+        self._split_rng = np.random.default_rng(split_seed)
         with h5py.File(self.filename, "r", swmr=True) as f:
             self.num_datapoints_max = f['X'].shape[0]
             if "max_num_classes" in f:
@@ -101,6 +107,12 @@ class PriorDumpDataLoader(DataLoader):
                     # adj = remove_axis(adj, list(range(num_features, adj.shape[1] - 1)))
 
                 single_eval_pos = f["single_eval_pos"][self.pointer : end]
+                if self.randomize_split:
+                    # draw one split per batch in [min_eval_pos, max_seq_in_batch - min_test]
+                    hi = max(self.min_eval_pos + 1, max_seq_in_batch - self.min_test)
+                    sep = int(self._split_rng.integers(self.min_eval_pos, hi))
+                else:
+                    sep = int(single_eval_pos[0])
 
                 self.pointer += self.batch_size
                 if self.pointer >= f["X"].shape[0]:
@@ -114,8 +126,9 @@ class PriorDumpDataLoader(DataLoader):
                     x=x.to(self.device),
                     y=y.to(self.device),
                     target_y=y.to(self.device),  # target_y is identical to y (for downstream compatibility)
-                    # Warning! Current code assumes that single_eval_pos is the same for all datasets in the batch, which should be the case if the data was generated with batch_size_per_gp=batch_size. If this is not the case, we will just take the single_eval_pos of the first dataset in the batch, which may lead to unexpected behaviour.
-                    single_eval_pos=single_eval_pos[0].item(),
+                    # One split per batch (downstream assumes a single scalar). Either the
+                    # stored value or a per-batch random draw (randomize_split=True).
+                    single_eval_pos=sep,
                     # adj=adj.to(self.device),
                     adj = None,
                 )
@@ -313,6 +326,7 @@ class GCFMDataLoader(DataLoader):
         extra_checks: bool = False,
         processor_class=None,
         processor_kwargs: Optional[Dict[str, Any]] = None,
+        seed: Optional[int] = None,
     ):
         self.batch_size = batch_size
         self.num_steps = num_steps
@@ -325,7 +339,7 @@ class GCFMDataLoader(DataLoader):
             scm_config=config["scm_config"],
             preprocessing_config=config.get("preprocessing_config"),
             dataset_config=config["dataset_config"],
-            seed=None,
+            seed=seed,
             processor_class=processor_class,
             processor_kwargs=processor_kwargs,
         )
@@ -369,6 +383,14 @@ class GCFMDataLoader(DataLoader):
                 density_moma = graph_info["density_moma"],
                 processor = graph_info["processor"],
                 graph_info = graph_info,
+                # Target-selection diagnostics (None for non-Reg2Cls processors).
+                node_variances = graph_info.get("node_variances"),
+                node_depths = graph_info.get("node_depths"),
+                target_node = graph_info.get("target_node"),
+                target_depth = graph_info.get("target_depth"),
+                target_variance = graph_info.get("target_variance"),
+                eligible_pool_size = graph_info.get("eligible_pool_size"),
+                n_rejections = graph_info.get("n_rejections"),
             )
         else:
             extra_info = dict()
@@ -410,6 +432,12 @@ class GCFMDataLoader(DataLoader):
         batch["adj_moma"] = torch.stack([d["adj_moma"] for d in dicts]).to(self.device)
         batch["density_moma"] = torch.tensor([d["density_moma"] for d in dicts], device=self.device)
 
+        # Target-selection diagnostics — kept as per-sample lists (per-node arrays are
+        # ragged across datasets, so they are not stacked into tensors).
+        for k in ("node_variances", "node_depths", "target_node", "target_depth",
+                  "target_variance", "eligible_pool_size", "n_rejections"):
+            batch[k] = [d.get(k) for d in dicts]
+
         return batch
 
     def __iter__(self):
@@ -449,6 +477,7 @@ class GCFMTabICLDataLoader(GCFMDataLoader):
         batch_size: int,
         num_steps: int,
         device: torch.device,
+        seed: Optional[int] = None,
     ):
         super().__init__(
             config=config,
@@ -457,7 +486,16 @@ class GCFMTabICLDataLoader(GCFMDataLoader):
             device=device,
             return_extra_info=True,
             processor_class=Reg2ClsProcessor,
-            processor_kwargs={"tabicl_hp": config.get("tabicl_hp")},
+            processor_kwargs={
+                "tabicl_hp": config.get("tabicl_hp"),
+                "target_selection_rule": config.get("target_selection_rule", "uniform"),
+                "band_fraction": config.get("band_fraction", 0.10),
+                "depth_temperature": config.get("depth_temperature", 1.0),
+                "depth_coupling_clean_at": config.get("depth_coupling_clean_at", None),
+                "feature_selection": config.get("feature_selection", "random"),
+                "noise_feature_fraction": config.get("noise_feature_fraction", 0.0),
+            },
+            seed=seed,
         )
 
 

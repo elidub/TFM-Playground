@@ -182,6 +182,11 @@ def train(model: NanoTabPFNModel, prior: DataLoader, criterion: nn.CrossEntropyL
                     callback.on_epoch_end(epoch, end_time - epoch_start_time, mean_loss, (model.module if multi_gpu else model), dist=criterion, tabarena_light=tabearena_light)
                 else:
                     callback.on_epoch_end(epoch, end_time - epoch_start_time, mean_loss, (model.module if multi_gpu else model), tabarena_light=tabearena_light)
+
+            # opt-in early stopping: a callback may set should_stop (e.g. eval-metric patience)
+            if any(getattr(cb, "should_stop", False) for cb in callbacks):
+                print(f"Early stopping at epoch {epoch}.")
+                break
         # for callback in callbacks:
         #     callback.on_train_end(epoch, end_time - epoch_start_time, mean_loss, (model.module if multi_gpu else model), dist=criterion if type(criterion) is FullSupportBarDistribution else None, tabarena_light=False)
     except KeyboardInterrupt:
