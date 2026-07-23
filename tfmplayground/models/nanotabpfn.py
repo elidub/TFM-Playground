@@ -10,22 +10,41 @@ from torch.nn.modules.transformer import LayerNorm, Linear, MultiheadAttention
 
 class NanoTabPFNModel(nn.Module):
     def __init__(
-        self, embedding_size: int, num_attention_heads: int, mlp_hidden_size: int, num_layers: int, num_outputs: int
+        self,
+        embedding_size: int,
+        num_attention_heads: int,
+        mlp_hidden_size: int,
+        num_layers: int,
+        num_outputs: int,
+        mask_attn: bool = False,
+        modded_encoder: bool = False,
+        compile_blocks: bool = False,
     ):
-        """Initializes the feature/target encoder, transformer blocks and decoder"""
+        """Initializes the feature/target encoder, transformer blocks and decoder
+
+        Args:
+            mask_attn: (bool) whether to mask the feature attention with the adjacency matrix (if given)
+            modded_encoder: (bool) whether to use the ModdedTransformerEncoderLayer
+            compile_blocks: (bool) whether to torch.compile each block. Only used when modded_encoder=True.
+                            Do not use during debugging (interferes with anomaly detection).
+        """
         super().__init__()
         self.embedding_size = embedding_size
         self.num_attention_heads = num_attention_heads
         self.mlp_hidden_size = mlp_hidden_size
         self.num_layers = num_layers
         self.num_outputs = num_outputs
+        self.mask_attn = mask_attn
+        self.modded_encoder = modded_encoder
         self.feature_encoder = FeatureEncoder(embedding_size)
         self.target_encoder = TargetEncoder(embedding_size)
+        layer_cls = ModdedTransformerEncoderLayer if modded_encoder else TransformerEncoderLayer
         self.transformer_blocks = nn.ModuleList()
         for _ in range(num_layers):
-            self.transformer_blocks.append(
-                TransformerEncoderLayer(embedding_size, num_attention_heads, mlp_hidden_size)
-            )
+            block = layer_cls(embedding_size, num_attention_heads, mlp_hidden_size)
+            if modded_encoder and compile_blocks:
+                block = torch.compile(block)
+            self.transformer_blocks.append(block)
         self.decoder = Decoder(embedding_size, mlp_hidden_size, num_outputs)
 
     # TODO: consider getting rid of this and just provide a single interface
@@ -38,10 +57,12 @@ class NanoTabPFNModel(nn.Module):
                 y_train: (torch.Tensor) a tensor of shape (batch_size, num_train_datapoints, 1)
                 X_test: (torch.Tensor) a tensor of shape (batch_size, num_test_datapoints, num_features)
 
-        model((x,y), train_test_split_index)
+        model((x,y[,adj]), train_test_split_index)
             Args:
                 x: (torch.Tensor) a tensor of shape (batch_size, num_datapoints, num_features)
                 y: (torch.Tensor) a tensor of shape (batch_size, num_train_datapoints, 1)
+                adj: (torch.Tensor | None) optional adjacency matrix of shape
+                     (batch_size, num_features+1, num_features+1) used for attention masking
 
 
         The former is similar to the sklearn interface.
@@ -54,20 +75,57 @@ class NanoTabPFNModel(nn.Module):
             (torch.Tensor) a tensor of shape (batch_size, num_test_datapoints, num_classes),
                            which represent the predicted logits
         """
-        if len(args) == 3:
+        if len(args) == 3 and not isinstance(args[0], tuple):
             # case model(train_x, train_y, test_x)
             x = args[0]
             if args[2] is not None:
                 x = torch.cat((x, args[2]), dim=1)
             return self._forward((x, args[1]), train_test_split_index=args[0].shape[1], **kwargs)
         elif len(args) == 1 and isinstance(args[0], tuple):
-            # case model((x,y), train_test_split_index=None)
+            # case model((x,y[,adj]), train_test_split_index=None)
             return self._forward(*args, **kwargs)
 
+    def get_attn_mask(self, adj: torch.Tensor) -> torch.Tensor | None:
+        """
+        Creates the attention mask from the adjacency matrix. From `torch.nn.modules.transformer.MultiheadAttention.forward`:
+
+        > For a binary mask, a ``True`` value indicates that the corresponding position is not allowed to attend.
+        > For a float mask, the mask values will be added to the attention weight.
+
+        Args:
+            adj: (torch.Tensor) a tensor of shape (batch_size, num_features+1, num_features+1),
+                 representing the adjacency matrix
+        Returns:
+            (torch.Tensor | None) a tensor of shape (batch_size, num_features+1, num_features+1)
+                                  representing the attention mask.
+        """
+        assert adj is not None
+
+        assert torch.all((adj == 0) | (adj == 1)), "adjacency matrix must be binary"
+        attn_mask = ~(adj.bool())
+
+        # set diagonal to False (a node can always attend to itself)
+        batch_size, num_nodes, _ = attn_mask.shape
+        diag_indices = torch.arange(num_nodes, device=attn_mask.device)
+        attn_mask[:, diag_indices, diag_indices] = False
+
+        return attn_mask
+
     def _forward(
-        self, src: tuple[torch.Tensor, torch.Tensor], train_test_split_index: int, num_mem_chunks: int = 1
+        self,
+        src: tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+        train_test_split_index: int,
+        num_mem_chunks: int = 1,
     ) -> torch.Tensor:
-        x_src, y_src = src
+        if len(src) == 3:
+            x_src, y_src, adj = src
+        else:
+            x_src, y_src = src
+            adj = None
+        if adj is not None:
+            assert x_src.shape[-1] == adj.shape[1] - 1, f"{x_src.shape = }, {adj.shape = }"
+        # If mask_attn is False, attn_mask = None, which results in no masking inside the blocks' attention.
+        attn_mask = self.get_attn_mask(adj) if (self.mask_attn and adj is not None) else None
         # we expect the labels to look like (batches, num_train_datapoints, 1),
         # so we add the last dimension if it is missing
         if len(y_src.shape) < len(x_src.shape):
@@ -84,7 +142,12 @@ class NanoTabPFNModel(nn.Module):
         src = torch.cat([x_src, y_src], 2)
         # repeatedly applies the transformer block on (B,R,C,E)
         for block in self.transformer_blocks:
-            src = block(src, train_test_split_index=train_test_split_index)
+            src = block(
+                src,
+                train_test_split_index=train_test_split_index,
+                attn_mask=attn_mask,
+                num_mem_chunks=num_mem_chunks,
+            )
         # selects the target embeddings (B,num_targets,1,E)
         output = src[:, train_test_split_index:, -1, :]
         # runs the embeddings through the decoder to get
@@ -166,6 +229,7 @@ class TransformerEncoderLayer(nn.Module):
         self.self_attention_between_features = MultiheadAttention(
             embedding_size, nhead, batch_first=batch_first, device=device, dtype=dtype
         )
+        self.nhead = nhead
 
         self.linear1 = Linear(embedding_size, mlp_hidden_size, device=device, dtype=dtype)
         self.linear2 = Linear(mlp_hidden_size, embedding_size, device=device, dtype=dtype)
@@ -174,7 +238,13 @@ class TransformerEncoderLayer(nn.Module):
         self.norm2 = LayerNorm(embedding_size, eps=layer_norm_eps, device=device, dtype=dtype)
         self.norm3 = LayerNorm(embedding_size, eps=layer_norm_eps, device=device, dtype=dtype)
 
-    def forward(self, src: torch.Tensor, train_test_split_index: int, num_mem_chunks: int = 1) -> torch.Tensor:
+    def forward(
+        self,
+        src: torch.Tensor,
+        train_test_split_index: int,
+        attn_mask: torch.Tensor | None = None,
+        num_mem_chunks: int = 1,
+    ) -> torch.Tensor:
         """
         Takes the embeddings of the table as input and applies self-attention between features
         and self-attention between datapoints followed by a simple 2 layer MLP.
@@ -183,6 +253,9 @@ class TransformerEncoderLayer(nn.Module):
             src: (torch.Tensor) a tensor of shape (batch_size, num_rows, num_features, embedding_size)
                                 that contains all the embeddings for all the cells in the table
             train_test_split_index: (int) the length of X_train
+            attn_mask: (torch.Tensor | None) a tensor of shape (batch_size, num_features, num_features)
+                                  representing the binary attention mask for the feature attention.
+                                  If None, no masking is applied.
             num_mem_chunks: (int) Number of chunks that memory-intense operations will be split into.
                                   Higher values use less memory but are slower. Needs to be set to 1
                                   during training to get correct gradients.
@@ -192,12 +265,15 @@ class TransformerEncoderLayer(nn.Module):
         batch_size, rows_size, col_size, embedding_size = src.shape
         # attention between features
         src = src.reshape(batch_size * rows_size, col_size, embedding_size)
+        attn_mask = attn_mask.repeat_interleave(rows_size, dim=0) if attn_mask is not None else None
 
         @memory_chunking(num_mem_chunks)
-        def feature_attention(x):
-            return self.self_attention_between_features(x, x, x)[0] + x
+        def feature_attention(x, attn_mask=None):
+            if attn_mask is not None and attn_mask.dim() == 3 and attn_mask.shape[0] == x.shape[0]:
+                attn_mask = attn_mask.repeat_interleave(self.nhead, dim=0)  # (B, S, S) -> (B * H, S, S)
+            return self.self_attention_between_features(x, x, x, attn_mask=attn_mask)[0] + x
 
-        src = feature_attention(src)
+        src = feature_attention(src, attn_mask=attn_mask)
         src = src.reshape(batch_size, rows_size, col_size, embedding_size)
         src = self.norm1(src)
         # attention between datapoints
@@ -237,31 +313,166 @@ class TransformerEncoderLayer(nn.Module):
         return src
 
 
+class ModdedTransformerEncoderLayer(nn.Module):
+    """
+    Pre-norm transformer block with explicit QKV projections and F.scaled_dot_product_attention.
+    Adapted from modded-nanotabpfn.
+
+    Key differences from a vanilla pre-norm block:
+    - Explicit output projections after SDPA (out_proj_features, out_proj_datapoints) to
+      re-scale attention outputs before the residual add, improving numerical stability
+      under bfloat16 autocast on CUDA.
+    - No @torch.compile on the instance method; compile at the model level instead via
+      NanoTabPFNModel(compile_blocks=True).
+    """
+
+    def __init__(
+        self, embedding_size: int, nhead: int, mlp_hidden_size: int, layer_norm_eps: float = 1e-5, device=None, dtype=None
+    ):
+        super().__init__()
+        self.nhead = nhead
+        self.head_dim = embedding_size // nhead
+        assert embedding_size % nhead == 0, "embedding_size must be divisible by nhead"
+
+        self.qkv_features = Linear(embedding_size, 3 * embedding_size, device=device, dtype=dtype)
+        self.qkv_datapoints = Linear(embedding_size, 3 * embedding_size, device=device, dtype=dtype)
+
+        # Output projections: re-scale SDPA output before residual add.
+        # This mirrors what nn.MultiheadAttention does internally and is critical for
+        # numerical stability in bfloat16, where the raw SDPA output can be large enough
+        # that the residual addition overflows.
+        self.out_proj_features = Linear(embedding_size, embedding_size, device=device, dtype=dtype)
+        self.out_proj_datapoints = Linear(embedding_size, embedding_size, device=device, dtype=dtype)
+
+        self.linear1 = Linear(embedding_size, mlp_hidden_size, device=device, dtype=dtype)
+        self.linear2 = Linear(mlp_hidden_size, embedding_size, device=device, dtype=dtype)
+
+        self.norm1 = LayerNorm(embedding_size, eps=layer_norm_eps, device=device, dtype=dtype)
+        self.norm2 = LayerNorm(embedding_size, eps=layer_norm_eps, device=device, dtype=dtype)
+        self.norm3 = LayerNorm(embedding_size, eps=layer_norm_eps, device=device, dtype=dtype)
+
+    def forward(
+        self,
+        src: torch.Tensor,
+        train_test_split_index: int,
+        attn_mask: torch.Tensor | None = None,
+        num_mem_chunks: int = 1,
+    ) -> torch.Tensor:
+        """
+        Pre-norm transformer block: norm -> attention -> out_proj -> residual, for both feature and
+        datapoint axes, followed by a pre-norm MLP.
+
+        Args:
+            src: (torch.Tensor) shape (batch_size, num_rows, num_features, embedding_size)
+            train_test_split_index: (int) number of training datapoints
+            attn_mask: (torch.Tensor | None) shape (batch_size, num_features, num_features),
+                       boolean mask for feature attention (True = ignore position)
+            num_mem_chunks: kept for API compatibility, not used in this implementation
+        Returns:
+            (torch.Tensor) shape (batch_size, num_rows, num_features, embedding_size)
+        """
+        batch_size, rows_size, col_size, embedding_size = src.shape
+
+        # --- Pre-norm feature attention (between features) ---
+        x = src.reshape(batch_size * rows_size, col_size, embedding_size)
+        res = x
+        x = self.norm1(x)
+
+        qkv = self.qkv_features(x)
+        qkv = qkv.reshape(batch_size * rows_size, col_size, 3, self.nhead, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        feat_attn_mask = None
+        if attn_mask is not None:
+            # (B, C, C) -> (B*R, 1, C, C) — broadcast over heads
+            # SDPA boolean masks are True = attend, the inverse of MultiheadAttention's convention
+            feat_attn_mask = ~attn_mask.repeat_interleave(rows_size, dim=0).unsqueeze(1)
+
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=feat_attn_mask)
+        x = x.transpose(1, 2).reshape(batch_size * rows_size, col_size, embedding_size)
+
+        # Output projection re-scales the attention output before the residual add,
+        # preventing overflow in bfloat16 (mirrors nn.MultiheadAttention behaviour).
+        x = self.out_proj_features(x)
+
+        src = (res + x).reshape(batch_size, rows_size, col_size, embedding_size)
+
+        # --- Pre-norm datapoint attention (between datapoints) ---
+        x = src.transpose(1, 2).reshape(batch_size * col_size, rows_size, embedding_size)
+        res = x
+        x = self.norm2(x)
+
+        qkv = self.qkv_datapoints(x)
+        qkv = qkv.reshape(batch_size * col_size, rows_size, 3, self.nhead, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q_left, q_right = q.split([train_test_split_index, rows_size - train_test_split_index], dim=2)
+        k_train = k[:, :, :train_test_split_index, :]
+        v_train = v[:, :, :train_test_split_index, :]
+
+        x_left = F.scaled_dot_product_attention(q_left, k_train, v_train)
+        x_right = F.scaled_dot_product_attention(q_right, k_train, v_train)
+
+        x = torch.cat([x_left, x_right], dim=2)
+        x = x.transpose(1, 2).reshape(batch_size * col_size, rows_size, embedding_size)
+
+        # Output projection for the datapoint attention path.
+        x = self.out_proj_datapoints(x)
+
+        src = (res + x).reshape(batch_size, col_size, rows_size, embedding_size).transpose(2, 1)
+
+        # --- Pre-norm MLP ---
+        res = src
+        x = self.norm3(src)
+        x = self.linear2(F.gelu(self.linear1(x)))
+        src = res + x
+
+        return src
+
+
 def memory_chunking(num_mem_chunks: int) -> callable:
     """
     This decorator will split the first dimension of the input into chunks and apply the wrapped function
     to each chunk separately.
+    Handles 'attn_mask' in kwargs by splitting it alongside the input.
     Args:
         num_mem_chunks: (int) Number of chunks to split the input into, higher values use less memory but are slower.
                           Needs to be set to 1 during training to disable chunking and get correct gradients.
     """
 
-    def decorator(func: Callable[[torch.Tensor], torch.Tensor]) -> Callable[[torch.Tensor], torch.Tensor]:
-        def wrapper(x: torch.Tensor) -> torch.Tensor:
+    def decorator(func: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        def wrapper(x: torch.Tensor, **kwargs) -> torch.Tensor:
             if num_mem_chunks <= 1 or x.shape[0] == 0:
-                return func(x)
+                return func(x, **kwargs)
             elif torch.is_grad_enabled():
                 warnings.warn(
                     "Memory chunking is disabled since gradient computation is enabled to avoid incorrect gradients. "
                     "Please use `with torch.no_grad():` during inference to enable chunking.",
                     stacklevel=2,
                 )
-                return func(x)
+                return func(x, **kwargs)
             chunk_size = max(1, math.ceil(x.shape[0] / num_mem_chunks))
-            for x_split in torch.split(x, split_size_or_sections=chunk_size, dim=0):
-                x_split[:] = func(
-                    x_split
-                )  # in-place modification to save memory, will cause wrong gradients if used during training
+            x_splits = torch.split(x, split_size_or_sections=chunk_size, dim=0)
+
+            attn_mask = kwargs.get("attn_mask")
+
+            if attn_mask is None:  # original implementation
+                for x_split in x_splits:
+                    x_split[:] = func(
+                        x_split, **kwargs
+                    )  # in-place modification to save memory, will cause wrong gradients if used during training
+            else:
+                # split the mask the same way as x
+                assert isinstance(attn_mask, torch.Tensor) and attn_mask.shape[0] == x.shape[0]
+                mask_splits = torch.split(attn_mask, split_size_or_sections=chunk_size, dim=0)
+
+                for x_split, mask_split in zip(x_splits, mask_splits):
+                    chunk_kwargs = kwargs.copy()
+                    chunk_kwargs["attn_mask"] = mask_split
+                    x_split[:] = func(x_split, **chunk_kwargs)
+
             return x
 
         return wrapper
