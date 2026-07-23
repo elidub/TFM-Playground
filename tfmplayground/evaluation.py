@@ -82,10 +82,12 @@ def get_openml_predictions(
     *,
     model: NanoTabPFNRegressor | NanoTabPFNClassifier,
     tasks: list[int] | str = "tabarena-v0.1",
-    max_n_features: int = 500,
-    max_n_samples: int = 10_000,
+    max_n_features: int | None = 500,
+    max_n_samples: int | None = 10_000,
+    max_n_classes: int | None = None,
     classification: bool | None = None,
     cache_directory: str | None = None,
+    tabarena_light: bool = True,
 ):
     """
     Evaluates a model on a set of OpenML tasks and returns predictions.
@@ -98,17 +100,22 @@ def get_openml_predictions(
             A scikit-learn compatible model or classifier to be evaluated.
         tasks (list[int] | str, optional):
             A list of OpenML task IDs or the name of a benchmark suite.
-        max_n_features (int, optional):
+        max_n_features (int | None, optional):
             Maximum number of features allowed for a task. Tasks exceeding this limit are skipped.
-        max_n_samples (int, optional):
+        max_n_samples (int | None, optional):
             Maximum number of instances allowed for a task. Tasks exceeding this limit are skipped.
+        max_n_classes (int | None, optional):
+            Maximum number of classes allowed for a classification task. Tasks exceeding this limit are skipped.
         classification (bool | None, optional):
             Whether the model is a classifier (True) or regressor (False). If None, it is inferred from the model type.
         cache_directory (str | None, optional):
             Directory to save OpenML data. If None, default cache path is used.
+        tabarena_light (bool, optional):
+            If True, uses a single repeat and single fold. If False, uses 10-repeat 3-fold CV for datasets
+            with <2500 samples, and 3-repeat 3-fold CV otherwise. Defaults to True.
     Returns:
-        dict: A dictionary where keys are dataset names and values are tuples of
-            (true targets, predicted labels, predicted probabilities).
+        dict: A dictionary keyed by "{dataset_name}/repeat{r}/fold{f}" whose values are tuples of
+            (true targets, predicted labels, predicted probabilities) for that split.
     """
     if classification is None:
         classification = isinstance(model, NanoTabPFNClassifier)  # TODO: change this once we support different models
@@ -136,46 +143,49 @@ def get_openml_predictions(
 
         n_features = dataset.qualities["NumberOfFeatures"]
         n_samples = dataset.qualities["NumberOfInstances"]
-        if n_features > max_n_features or n_samples > max_n_samples:
-            continue  # skip task, too big
+        n_classes = dataset.qualities["NumberOfClasses"]
 
-        _, folds, _ = task.get_split_dimensions()
-        tabarena_light = True
+        if (
+            (max_n_features is not None and n_features > max_n_features)
+            or (max_n_samples is not None and n_samples > max_n_samples)
+            or (max_n_classes is not None and n_classes > max_n_classes)
+        ):
+            continue  # skip task
+
         if tabarena_light:
-            folds = 1  # code supports multiple folds but tabarena_light only has one
-        repeat = 0  # code only supports one repeat
-        targets = []
-        predictions = []
-        probabilities = []
-        for fold in range(folds):
-            X, y, categorical_indicator, attribute_names = dataset.get_data(
-                target=task.target_name, dataset_format="dataframe"
-            )
-            train_indices, test_indices = task.get_train_test_split_indices(fold=fold, repeat=repeat)
-            X_train = X.iloc[train_indices].to_numpy()
-            y_train = y.iloc[train_indices].to_numpy()
-            X_test = X.iloc[test_indices].to_numpy()
-            y_test = y.iloc[test_indices].to_numpy()
+            n_repeats, n_folds = 1, 1
+        elif n_samples < 2500:
+            n_repeats, n_folds = 10, 3
+        else:
+            n_repeats, n_folds = 3, 3
 
-            if classification:
-                label_encoder = LabelEncoder()
-                y_train = label_encoder.fit_transform(y_train)
-                y_test = label_encoder.transform(y_test)
-            targets.append(y_test)
+        X, y, categorical_indicator, attribute_names = dataset.get_data(
+            target=task.target_name, dataset_format="dataframe"
+        )
 
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
-            predictions.append(y_pred)
-            if classification:
-                y_proba = model.predict_proba(X_test)
-                if y_proba.shape[1] == 2:  # binary classification
-                    y_proba = y_proba[:, 1]
-                probabilities.append(y_proba)
+        for repeat in range(n_repeats):
+            for fold in range(n_folds):
+                train_indices, test_indices = task.get_train_test_split_indices(fold=fold, repeat=repeat)
+                X_train = X.iloc[train_indices].to_numpy()
+                y_train = y.iloc[train_indices].to_numpy()
+                X_test = X.iloc[test_indices].to_numpy()
+                y_test = y.iloc[test_indices].to_numpy()
 
-        y_pred = np.concatenate(predictions, axis=0)
-        targets = np.concatenate(targets, axis=0)
-        probabilities = np.concatenate(probabilities, axis=0) if len(probabilities) > 0 else None
-        dataset_predictions[str(dataset.name)] = (targets, y_pred, probabilities)
+                if classification:
+                    label_encoder = LabelEncoder()
+                    y_train = label_encoder.fit_transform(y_train)
+                    y_test = label_encoder.transform(y_test)
+
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+                y_proba = None
+                if classification:
+                    y_proba = model.predict_proba(X_test)
+                    if y_proba.shape[1] == 2:  # binary classification
+                        y_proba = y_proba[:, 1]
+
+                dataset_key = f"{dataset.name}/repeat{repeat}/fold{fold}"
+                dataset_predictions[dataset_key] = (y_test, y_pred, y_proba)
     return dataset_predictions
 
 
