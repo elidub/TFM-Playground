@@ -164,6 +164,7 @@ class NanoTabPFNRegressor:
             model = "checkpoints/nanotabpfn_regressor.pth"
             dist = "checkpoints/nanotabpfn_regressor_buckets.pth"
             if not os.path.isfile(model):
+                raise ValueError("Model should be specified to NanoTabPFNRegressor")
                 print("No cached model found, downloading model checkpoint.")
                 response = requests.get(
                     "https://ml.informatik.uni-freiburg.de/research-artifacts/pfefferle/TFM-Playground/nanotabpfn_regressor.pth"
@@ -171,6 +172,7 @@ class NanoTabPFNRegressor:
                 with open(model, "wb") as f:
                     f.write(response.content)
             if not os.path.isfile(dist):
+                raise ValueError("Bucket edges should be specified to NanoTabPFNRegressor")
                 print("No cached bucket edges found, downloading bucket edges.")
                 response = requests.get(
                     "https://ml.informatik.uni-freiburg.de/research-artifacts/pfefferle/TFM-Playground/nanotabpfn_regressor_buckets.pth"
