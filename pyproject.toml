@@ -47,6 +47,11 @@ Issues = "https://github.com/automl/TFM-Playground/issues"
 [tool.setuptools]
 packages = { find = { include = ["tfmplayground*"] } }
 
+[tool.uv.sources]
+# tabicl is a member of the TFM uv workspace; uv requires the source entry
+# even though tabicl only appears in the external-priors extra
+tabicl = { workspace = true }
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
