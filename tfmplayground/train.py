@@ -1,5 +1,6 @@
 import os
 import time
+from contextlib import nullcontext
 
 import schedulefree
 import torch
@@ -10,6 +11,8 @@ from torch.utils.data import DataLoader
 from tfmplayground.callbacks import Callback
 from tfmplayground.models.nanotabpfn import NanoTabPFNModel
 from tfmplayground.utils import get_default_device
+
+torch.set_float32_matmul_precision("high")
 
 
 def train(
@@ -24,6 +27,8 @@ def train(
     ckpt: dict[str, torch.Tensor] = None,
     multi_gpu: bool = False,
     run_name: str = "tfmplayground",
+    workdir: str = ".",
+    use_muon: bool = True,
 ):
     """
     Trains our model on the given prior using the given criterion.
@@ -40,11 +45,14 @@ def train(
             logging, validation, or other custom actions.
         ckpt (Dict[str, torch.Tensor], optional): A checkpoint dictionary containing the model and optimizer states,
             as well as the last completed epoch. If provided, training resumes from this checkpoint.
+        workdir: (str) base directory for checkpoints; checkpoints go to <workdir>/<run_name>/.
+        use_muon: (bool) if True, optimize the 2-D transformer parameters with Muon and the rest
+            with AdamWScheduleFree; if False, use AdamWScheduleFree for everything.
 
     Returns:
         (torch.Tensor) a tensor of shape (num_rows, batch_size, num_features, embedding_size)
     """
-    work_dir = "workdir/" + run_name
+    work_dir = os.path.join(workdir, run_name)
     os.makedirs(work_dir, exist_ok=True)
     if multi_gpu:
         model = nn.DataParallel(model)
@@ -53,24 +61,74 @@ def train(
     if not device:
         device = get_default_device()
     model.to(device)
-    optimizer = schedulefree.AdamWScheduleFree(model.parameters(), lr=lr, weight_decay=0.0)
+
+    adam_kwargs = {"lr": lr}
+    if use_muon:
+        from gtfm.trainer.muon import Muon  # deferred: only needed with use_muon=True
+
+        muon_params = []
+        adam_params = []
+        for name, p in model.named_parameters():
+            if p.ndim != 2:
+                adam_params.append(p)
+            elif "transformer_blocks" in name:
+                muon_params.append(p)
+            else:
+                adam_params.append(p)
+        optimizer_muon = Muon(muon_params, lr=0.1 * lr, momentum=0.95)
+        optimizer_adam = schedulefree.AdamWScheduleFree(adam_params, **adam_kwargs)
+        optimizers = [optimizer_muon, optimizer_adam]
+    else:
+        optimizer_muon = None
+        optimizer_adam = schedulefree.AdamWScheduleFree(model.parameters(), **adam_kwargs)
+        optimizers = [optimizer_adam]
+
     if ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
+        if "optimizer_adam" in ckpt:
+            optimizer_adam.load_state_dict(ckpt["optimizer_adam"])
+        elif "optimizer" in ckpt:  # backwards compat
+            optimizer_adam.load_state_dict(ckpt["optimizer"])
+        if use_muon and optimizer_muon is not None and "optimizer_muon" in ckpt:
+            optimizer_muon.load_state_dict(ckpt["optimizer_muon"])
+
     classification_task = isinstance(criterion, nn.CrossEntropyLoss)
     regression_task = not classification_task
 
     assert prior.num_steps % accumulate_gradients == 0, "num_steps must be divisible by accumulate_gradients"
 
+    device_type = torch.device(device).type
+    use_amp = device_type in ("cuda", "mps")
+    autocast_ctx = (
+        (lambda: torch.autocast(device_type=device_type, dtype=torch.bfloat16)) if use_amp else nullcontext
+    )
+
     try:
         for epoch in range(ckpt["epoch"] + 1 if ckpt else 1, epochs + 1):
+            accumulated_steps = 0
             epoch_start_time = time.time()
             model.train()  # Turn on the train mode
-            optimizer.train()
+            optimizer_adam.train()
             total_loss = 0.0
+            valid_steps = 0
             for i, full_data in enumerate(prior):
                 train_test_split_index = full_data["train_test_split_index"]
-                data = (full_data["x"].to(device), full_data["y"][:, :train_test_split_index].to(device))
+                data = (
+                    full_data["x"].to(device),
+                    full_data["y"][:, :train_test_split_index].to(device),
+                    full_data["adj"].to(device) if full_data.get("adj") is not None else None,
+                )
                 if torch.isnan(data[0]).any() or torch.isnan(data[1]).any():
+                    x_nans = torch.isnan(data[0]).sum().item()
+                    x_total = data[0].numel()
+                    y_nans = torch.isnan(data[1]).sum().item()
+                    y_total = data[1].numel()
+                    print(
+                        f"NaNs in input data (x_nans/x_total): {x_nans}/{x_total} (x), "
+                        f"{y_nans}/{y_total} (y). Should skip this batch!"
+                    )  # TODO: Should inspect if this is happening
+                    for opt in optimizers:
+                        opt.zero_grad(set_to_none=True)
+                    accumulated_steps = 0
                     continue
                 targets = full_data["target_y"].to(device)
 
@@ -78,30 +136,44 @@ def train(
                     y_mean = data[1].mean(dim=1, keepdim=True)
                     y_std = data[1].std(dim=1, keepdim=True) + 1e-8
                     y_norm = (data[1] - y_mean) / y_std
-                    data = (data[0], y_norm)
+                    data = (data[0], y_norm, data[2])
 
-                output = model(data, train_test_split_index=train_test_split_index)
-                targets = targets[:, train_test_split_index:]
-                if regression_task:
-                    targets = (targets - y_mean) / y_std
-                if classification_task:
-                    targets = targets.reshape((-1,)).to(torch.long)
-                    output = output.view(-1, output.shape[-1])
+                with autocast_ctx():
+                    output = model(data, train_test_split_index=train_test_split_index)
+                    targets = targets[:, train_test_split_index:]
+                    if regression_task:
+                        targets = (targets - y_mean) / y_std
+                    if classification_task:
+                        targets = targets.reshape((-1,)).to(torch.long)
+                        output = output.view(-1, output.shape[-1])
 
-                losses = criterion(output, targets)
+                    losses = criterion(output, targets)
                 loss = losses.mean() / accumulate_gradients
+                if torch.isnan(loss):
+                    raise ValueError("Loss is NaN, stopping training")
+                if loss.item() > 10:
+                    print(f"Skipping extreme loss > 10: {loss.item()}")
+                    for opt in optimizers:
+                        opt.zero_grad(set_to_none=True)
+                    accumulated_steps = 0
+                    continue
                 loss.backward()
+                accumulated_steps += 1
                 total_loss += loss.cpu().detach().item() * accumulate_gradients
+                valid_steps += 1
+                del output, targets, losses, loss, data, full_data
 
-                if (i + 1) % accumulate_gradients == 0:
+                if accumulated_steps % accumulate_gradients == 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
+                    for opt in optimizers:
+                        opt.step()
+                    for opt in optimizers:
+                        opt.zero_grad(set_to_none=True)
 
             end_time = time.time()
-            mean_loss = total_loss / len(prior)
+            mean_loss: float = total_loss / valid_steps if valid_steps > 0 else float("nan")
             model.eval()
-            optimizer.eval()
+            optimizer_adam.eval()
 
             training_state = {
                 "epoch": epoch,
@@ -113,11 +185,14 @@ def train(
                     "num_outputs": int((model.module if multi_gpu else model).num_outputs),
                 },
                 "model": (model.module if multi_gpu else model).state_dict(),
-                "optimizer": optimizer.state_dict(),
+                "optimizer_adam": optimizer_adam.state_dict(),
+                **({"optimizer_muon": optimizer_muon.state_dict()} if optimizer_muon is not None else {}),
             }
             torch.save(training_state, work_dir + "/latest_checkpoint.pth")
 
             for callback in callbacks:
+                # full evaluation only on the last epoch, light evaluation otherwise
+                tabarena_light = epoch != epochs
                 if type(criterion) is FullSupportBarDistribution:
                     callback.on_epoch_end(
                         epoch,
@@ -125,13 +200,18 @@ def train(
                         mean_loss,
                         (model.module if multi_gpu else model),
                         dist=criterion,
+                        tabarena_light=tabarena_light,
                     )
                 else:
                     callback.on_epoch_end(
-                        epoch, end_time - epoch_start_time, mean_loss, (model.module if multi_gpu else model)
+                        epoch,
+                        end_time - epoch_start_time,
+                        mean_loss,
+                        (model.module if multi_gpu else model),
+                        tabarena_light=tabarena_light,
                     )
     except KeyboardInterrupt:
-        pass
+        print("Interrupting!")
     finally:
         for callback in callbacks:
             callback.close()
