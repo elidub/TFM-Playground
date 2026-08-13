@@ -123,6 +123,7 @@ def dump_prior_to_h5(
             maxshape=(None, max_seq_len, max_features),
             chunks=(batch_size, max_seq_len, max_features),
             compression="lzf",
+            dtype="f4",
         )
         dump_num_features = f.create_dataset(
             "num_features", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype="i4"
@@ -131,7 +132,7 @@ def dump_prior_to_h5(
             "num_datapoints", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype="i4"
         )
         dump_y = f.create_dataset(
-            "y", shape=(0, max_seq_len), maxshape=(None, max_seq_len), chunks=(batch_size, max_seq_len)
+            "y", shape=(0, max_seq_len), maxshape=(None, max_seq_len), chunks=(batch_size, max_seq_len), dtype="f4"
         )
         dump_train_test_split_index = f.create_dataset(
             "train_test_split_index", shape=(0,), maxshape=(None,), chunks=(batch_size,), dtype="i4"
