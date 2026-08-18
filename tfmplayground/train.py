@@ -64,7 +64,7 @@ def train(
 
     adam_kwargs = {"lr": lr}
     if use_muon:
-        from gtfm.trainer.muon import Muon  # deferred: only needed with use_muon=True
+        raise NotImplementedError("Muon optimizer is not supported anymore, use modded-nanotabpfn instead.")
 
         muon_params = []
         adam_params = []
