@@ -71,7 +71,9 @@ class PriorDumpDataLoader(DataLoader):
             self.has_num_datapoints = "num_datapoints" in f
             self.stored_max_seq_len = f["X"].shape[1]
         self.device = device
-        self.pointer = starting_index
+        # resuming past the end of the dump wraps around, the same way
+        # __iter__ does once it runs out of datasets
+        self.pointer = starting_index % self.num_datapoints_max
 
     def __iter__(self):
         with h5py.File(self.filename, "r") as f:
